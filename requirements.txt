@@ -1,5 +1,5 @@
 python-telegram-bot>=20.7
 pypdf>=3.17.4
-google-generativeai>=0.3.2
+google-genai>=0.1.0
 supabase>=2.3.0
 httpx>=0.25.0
