@@ -6,101 +6,77 @@ import pypdf
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from supabase import create_client
-from google import genai
+from groq import Groq
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_KEY = os.environ.get("GEMINI_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-ai_client = genai.Client(api_key=GEMINI_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
-def split_pdf_by_pages(file_path, pages_per_split=8):
+def extract_chunks_from_pdf(file_path, pages_per_chunk=5):
     reader = pypdf.PdfReader(file_path)
     total_pages = len(reader.pages)
-    split_files = []
+    chunks = []
     
-    for i in range(0, total_pages, pages_per_split):
-        writer = pypdf.PdfWriter()
-        end_page = min(i + pages_per_split, total_pages)
-        for page_idx in range(i, end_page):
-            writer.add_page(reader.pages[page_idx])
+    current_text = ""
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text() or ""
+        current_text += text + "\n"
+        if (i + 1) % pages_per_chunk == 0 or (i + 1) == total_pages:
+            if len(current_text.strip()) > 30:
+                chunks.append((current_text, i + 1))
+            current_text = ""
             
-        temp_chunk_path = f"/tmp/chunk_{i}_{end_page}.pdf"
-        with open(temp_chunk_path, "wb") as f:
-            writer.write(f)
-        split_files.append((temp_chunk_path, i+1, end_page))
-        
-    return split_files, total_pages
+    return chunks, total_pages
 
-def process_pdf_chunk_with_gemini(chunk_pdf_path):
-    prompt = """
-    Analyze this PDF pages directly (including two-column layouts, scanned images, and text).
+def process_chunk_with_groq(text_chunk):
+    prompt = f"""
+    Analyze this text extracted from exam pages (including multi-column layouts, MCQs, or study notes).
     Extract all questions, MCQs, or study notes/one-liners and return ONLY a raw JSON array of objects.
     
-    Each object must have these exact keys:
+    Each object MUST have these exact keys:
     "question", "option_a", "option_b", "option_c", "option_d", "correct_option", "explanation", "exam", "subject", "chapter", "language"
 
-    STRICT RULES:
-    1. Handle 2-column or multi-column layouts carefully so question reading order is maintained.
-    2. If Subject is Hindi, keep language Hindi. Otherwise translate everything to English.
-    3. Convert one-liners or notes into proper 4-option MCQs logically.
-    4. Return ONLY the raw JSON array. Do not add markdown like ```json or any extra text.
+    RULES:
+    1. If Subject/Text is Hindi, keep language Hindi. Otherwise translate everything to English.
+    2. Convert study notes or one-liners into proper 4-option MCQs logically.
+    3. Output ONLY the raw JSON array. Do not add markdown like ```json or any intro/outro text.
+
+    Text:
+    {text_chunk[:12000]}
     """
     
-    uploaded_file = None
-    max_retries = 3
-    
-    for attempt in range(max_retries):
-        try:
-            if not uploaded_file:
-                uploaded_file = ai_client.files.upload(file=chunk_pdf_path)
-                
-            while uploaded_file.state.name == "PROCESSING":
-                time.sleep(1)
-                uploaded_file = ai_client.files.get(name=uploaded_file.name)
-                
-            response = ai_client.models.generate_content(
-                model='gemini-1.5-flash',
-                contents=[uploaded_file, prompt]
-            )
+    try:
+        response = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are an expert exam parser that outputs only raw JSON arrays."},
+                {"role": "user", "content": prompt}
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.2
+        )
+        
+        raw_text = response.choices[0].message.content.strip()
+        
+        if raw_text.startswith("```json"):
+            raw_text = raw_text[7:]
+        if raw_text.startswith("```"):
+            raw_text = raw_text[3:]
+        if raw_text.endswith("```"):
+            raw_text = raw_text[:-3]
             
-            raw_text = response.text.strip()
-            if raw_text.startswith("```json"):
-                raw_text = raw_text[7:]
-            if raw_text.startswith("```"):
-                raw_text = raw_text[3:]
-            if raw_text.endswith("```"):
-                raw_text = raw_text[:-3]
-                
-            data = json.loads(raw_text.strip())
-            
-            if uploaded_file:
-                try:
-                    ai_client.files.delete(name=uploaded_file.name)
-                except Exception:
-                    pass
-            return data if isinstance(data, list) else []
-            
-        except Exception as e:
-            err_msg = str(e)
-            print(f"Attempt {attempt+1} error: {err_msg}")
-            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                # Rate limit hit -> Wait 12 seconds before retry
-                time.sleep(12)
-            else:
-                time.sleep(3)
-                
-    if uploaded_file:
-        try:
-            ai_client.files.delete(name=uploaded_file.name)
-        except Exception:
-            pass
-    return []
+        data = json.loads(raw_text.strip())
+        return data if isinstance(data, list) else []
+        
+    except Exception as e:
+        print(f"Groq API Error: {e}")
+        return []
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Hello! Send me any PDF file (including scanned or 2-column PDFs) and I will extract MCQs to your Supabase Database.")
+    await update.message.reply_text("👋 Hello! Send me any PDF file and I will extract and save MCQs to your Supabase Database using Groq AI.")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -114,27 +90,33 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_path = f"/tmp/{update.message.document.file_name}"
     await file.download_to_drive(file_path)
     
-    status_msg = await update.message.reply_text("⚙️ Preparing PDF for AI OCR processing...")
+    status_msg = await update.message.reply_text("⚙️ Reading PDF file...")
     
     try:
-        split_chunks, total_pages = split_pdf_by_pages(file_path, pages_per_split=8)
+        chunks, total_pages = extract_chunks_from_pdf(file_path, pages_per_chunk=5)
     except Exception as e:
-        await status_msg.edit_text(f"❌ Failed to split PDF: {str(e)}")
+        await status_msg.edit_text(f"❌ Failed to read PDF: {str(e)}")
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return
+
+    if not chunks:
+        await status_msg.edit_text("❌ Could not extract text. If it is a completely image-only scanned PDF, please try a readable text PDF.")
         if os.path.exists(file_path):
             os.remove(file_path)
         return
 
     saved_count = 0
     duplicate_count = 0
-    total_splits = len(split_chunks)
+    total_splits = len(chunks)
     
-    for idx, (chunk_path, start_p, end_p) in enumerate(split_chunks):
+    for idx, (chunk_text, page_num) in enumerate(chunks):
         try:
-            await status_msg.edit_text(f"⚙️ Processing Pages {start_p}-{end_p} of {total_pages} (Batch {idx+1}/{total_splits})...\n📥 Saved Questions: {saved_count}")
+            await status_msg.edit_text(f"⚙️ Groq AI Processing: Page {page_num}/{total_pages} (Batch {idx+1}/{total_splits})...\n📥 Saved Questions: {saved_count}")
         except Exception:
             pass
             
-        mcqs = process_pdf_chunk_with_gemini(chunk_path)
+        mcqs = process_chunk_with_groq(chunk_text)
         
         for item in mcqs:
             q_text = item.get("question")
@@ -162,16 +144,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 duplicate_count += 1
 
-        if os.path.exists(chunk_path):
-            os.remove(chunk_path)
-            
-        # Delay to stay within Google's Free Tier Rate Limits
-        time.sleep(5)
+        time.sleep(1)
 
     if os.path.exists(file_path):
         os.remove(file_path)
         
-    await status_msg.edit_text(f"✅ Processing Complete!\n\n📥 Saved Questions: {saved_count}\n⚠️ Duplicates/Skipped: {duplicate_count}")
+    await status_msg.edit_text(f"✅ Processing Complete!\n\n📥 Total Saved: {saved_count}\n⚠️ Duplicates/Skipped: {duplicate_count}")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -186,4 +164,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-            
+        
