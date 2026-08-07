@@ -16,7 +16,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-def extract_chunks_from_pdf(file_path, pages_per_chunk=5):
+def extract_chunks_from_pdf(file_path, pages_per_chunk=3):
     reader = pypdf.PdfReader(file_path)
     total_pages = len(reader.pages)
     chunks = []
@@ -34,49 +34,74 @@ def extract_chunks_from_pdf(file_path, pages_per_chunk=5):
 
 def process_chunk_with_groq(text_chunk):
     prompt = f"""
-    Analyze this text extracted from exam pages (including multi-column layouts, MCQs, or study notes).
-    Extract all questions, MCQs, or study notes/one-liners and return ONLY a raw JSON array of objects.
-    
-    Each object MUST have these exact keys:
-    "question", "option_a", "option_b", "option_c", "option_d", "correct_option", "explanation", "exam", "subject", "chapter", "language"
+    Analyze this text extracted from exam PDF/notes.
+    It can be MCQs with options OR One-Liner Question & Answer table formats.
 
-    RULES:
-    1. If Subject/Text is Hindi, keep language Hindi. Otherwise translate everything to English.
-    2. Convert study notes or one-liners into proper 4-option MCQs logically.
-    3. Output ONLY the raw JSON array. Do not add markdown like ```json or any intro/outro text.
+    TASK:
+    Extract all questions and output ONLY a raw JSON array of objects.
+
+    FORMAT:
+    [
+      {{
+        "question": "Question text here",
+        "option_a": "Option A or Correct Answer",
+        "option_b": "Option B or Logical distractor",
+        "option_c": "Option C or Logical distractor",
+        "option_d": "Option D or Logical distractor",
+        "correct_option": "A",
+        "explanation": "Brief context",
+        "exam": "General GK",
+        "subject": "General Knowledge",
+        "chapter": "General",
+        "language": "English"
+      }}
+    ]
+
+    STRICT INSTRUCTIONS:
+    1. If the text is a Question & Answer list (without options), place the correct answer in option_a, generate 3 reasonable fake options for B, C, D, and set correct_option to "A".
+    2. If it is already a 4-option MCQ, parse options A, B, C, D and correct answer accurately.
+    3. Output ONLY valid JSON array without ```json backticks or extra lines.
 
     Text:
-    {text_chunk[:12000]}
+    {text_chunk[:10000]}
     """
     
-    try:
-        response = groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are an expert exam parser that outputs only raw JSON arrays."},
-                {"role": "user", "content": prompt}
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.2
-        )
-        
-        raw_text = response.choices[0].message.content.strip()
-        
-        if raw_text.startswith("```json"):
-            raw_text = raw_text[7:]
-        if raw_text.startswith("```"):
-            raw_text = raw_text[3:]
-        if raw_text.endswith("```"):
-            raw_text = raw_text[:-3]
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "You are a JSON parser that outputs valid raw JSON arrays only."},
+                    {"role": "user", "content": prompt}
+                ],
+                model="llama-3.1-8b-instant",
+                temperature=0.1
+            )
             
-        data = json.loads(raw_text.strip())
-        return data if isinstance(data, list) else []
-        
-    except Exception as e:
-        print(f"Groq API Error: {e}")
-        return []
+            raw_text = response.choices[0].message.content.strip()
+            
+            if raw_text.startswith("```json"):
+                raw_text = raw_text[7:]
+            if raw_text.startswith("```"):
+                raw_text = raw_text[3:]
+            if raw_text.endswith("```"):
+                raw_text = raw_text[:-3]
+                
+            data = json.loads(raw_text.strip())
+            return data if isinstance(data, list) else []
+            
+        except Exception as e:
+            err_msg = str(e)
+            print(f"Attempt {attempt+1} Groq Error: {err_msg}")
+            if "429" in err_msg:
+                time.sleep(10)
+            else:
+                time.sleep(2)
+                
+    return []
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Hello! Send me any PDF file and I will extract and save MCQs to your Supabase Database using Groq AI.")
+    await update.message.reply_text("👋 Hello! Send me any PDF file (MCQs or One-liner Q&A tables) and I will extract and save them to Supabase.")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -93,7 +118,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("⚙️ Reading PDF file...")
     
     try:
-        chunks, total_pages = extract_chunks_from_pdf(file_path, pages_per_chunk=5)
+        chunks, total_pages = extract_chunks_from_pdf(file_path, pages_per_chunk=3)
     except Exception as e:
         await status_msg.edit_text(f"❌ Failed to read PDF: {str(e)}")
         if os.path.exists(file_path):
@@ -101,7 +126,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not chunks:
-        await status_msg.edit_text("❌ Could not extract text. If it is a completely image-only scanned PDF, please try a readable text PDF.")
+        await status_msg.edit_text("❌ Could not extract text from this PDF. Please try a readable text PDF.")
         if os.path.exists(file_path):
             os.remove(file_path)
         return
@@ -144,7 +169,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 duplicate_count += 1
 
-        time.sleep(1)
+        time.sleep(2)
 
     if os.path.exists(file_path):
         os.remove(file_path)
@@ -164,4 +189,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
+            
