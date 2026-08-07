@@ -1,14 +1,16 @@
-name: Telegram MCQ Bot Runner
+name: Telegram MCQ Cluster Engine
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # Runs automatically every 6 hours
 
 jobs:
-  run-bot:
+  run-cluster-bot:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Code
+    - name: Checkout Repository
       uses: actions/checkout@v3
 
     - name: Set up Python
@@ -21,11 +23,14 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Run Bot
+    - name: Run Telegram Bot Cluster
       env:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+        SUPABASE_URL_1: ${{ secrets.SUPABASE_URL_1 }}
+        SUPABASE_KEY_1: ${{ secrets.SUPABASE_KEY_1 }}
+        SUPABASE_URL_2: ${{ secrets.SUPABASE_URL_2 }}
+        SUPABASE_KEY_2: ${{ secrets.SUPABASE_KEY_2 }}
       run: python bot.py
       
