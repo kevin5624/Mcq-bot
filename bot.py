@@ -1,4 +1,5 @@
 import os
+import time
 import hashlib
 import json
 import pypdf
@@ -15,7 +16,7 @@ GEMINI_KEY = os.environ.get("GEMINI_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
-def extract_chunks_from_pdf(file_path, pages_per_chunk=5):
+def extract_chunks_from_pdf(file_path, pages_per_chunk=3):
     reader = pypdf.PdfReader(file_path)
     total_pages = len(reader.pages)
     chunks = []
@@ -44,7 +45,7 @@ def process_chunk_with_ai(text_chunk):
     3. Output ONLY the JSON array without backticks or ```json.
 
     Text:
-    {text_chunk[:10000]}
+    {text_chunk[:8000]}
     """
     try:
         response = ai_client.models.generate_content(
@@ -53,7 +54,6 @@ def process_chunk_with_ai(text_chunk):
         )
         raw_text = response.text.strip()
         
-        # Clean potential markdown formatting
         if raw_text.startswith("```json"):
             raw_text = raw_text[7:]
         if raw_text.startswith("```"):
@@ -68,7 +68,7 @@ def process_chunk_with_ai(text_chunk):
         return []
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Hello! Send me any PDF file and I will extract and save MCQs to your Supabase Database.")
+    await update.message.reply_text("👋 Hello! Send me any PDF file and I will extract and save MCQs directly to your Supabase Database.")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -82,12 +82,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_path = f"/tmp/{update.message.document.file_name}"
     await file.download_to_drive(file_path)
     
-    status_msg = await update.message.reply_text("⚙️ Reading PDF and extracting text...")
+    status_msg = await update.message.reply_text("⚙️ Reading PDF and preparing batches...")
     
-    chunks = extract_chunks_from_pdf(file_path, pages_per_chunk=5)
+    # Large PDFs handled smoothly with 3 pages per chunk
+    chunks = extract_chunks_from_pdf(file_path, pages_per_chunk=3)
     
     if not chunks:
-        await status_msg.edit_text("❌ Could not read text from this PDF. If it is an image/scanned PDF, please try a text-based PDF.")
+        await status_msg.edit_text("❌ Could not read text from this PDF. Please ensure it is a text-based PDF.")
         if os.path.exists(file_path):
             os.remove(file_path)
         return
@@ -97,34 +98,43 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_chunks = len(chunks)
     
     for idx, chunk in enumerate(chunks):
-        await status_msg.edit_text(f"⚙️ Extracting MCQs from Batch {idx+1}/{total_chunks}...")
+        # Update progress every 2 batches to avoid Telegram Rate Limits
+        if idx % 2 == 0 or idx == total_chunks - 1:
+            try:
+                await status_msg.edit_text(f"⚙️ Processing Batch {idx+1}/{total_chunks}...\n📥 Saved so far: {saved_count}")
+            except Exception:
+                pass
+                
         mcqs = process_chunk_with_ai(chunk)
         
         for item in mcqs:
             q_text = item.get("question")
-            if not q_text or len(q_text.strip()) < 5:
+            if not q_text or len(str(q_text).strip()) < 5:
                 continue
                 
-            q_hash = hashlib.sha256(q_text.strip().encode()).hexdigest()
+            q_hash = hashlib.sha256(str(q_text).strip().encode()).hexdigest()
             
             try:
                 supabase.table("questions").insert({
-                    "question_text": q_text.strip(),
-                    "option_a": item.get("option_a", "N/A"),
-                    "option_b": item.get("option_b", "N/A"),
-                    "option_c": item.get("option_c", "N/A"),
-                    "option_d": item.get("option_d", "N/A"),
+                    "question_text": str(q_text).strip(),
+                    "option_a": str(item.get("option_a", "N/A")),
+                    "option_b": str(item.get("option_b", "N/A")),
+                    "option_c": str(item.get("option_c", "N/A")),
+                    "option_d": str(item.get("option_d", "N/A")),
                     "correct_option": str(item.get("correct_option", "A")).upper()[:1],
-                    "explanation": item.get("explanation", ""),
-                    "exam_name": item.get("exam", "General"),
-                    "subject_name": item.get("subject", "General"),
-                    "chapter_name": item.get("chapter", "General"),
-                    "language": item.get("language", "English"),
+                    "explanation": str(item.get("explanation", "")),
+                    "exam_name": str(item.get("exam", "General")),
+                    "subject_name": str(item.get("subject", "General")),
+                    "chapter_name": str(item.get("chapter", "General")),
+                    "language": str(item.get("language", "English")),
                     "content_hash": q_hash
                 }).execute()
                 saved_count += 1
             except Exception:
                 duplicate_count += 1
+                
+        # Small delay to respect Gemini AI Rate Limits
+        time.sleep(2)
 
     if os.path.exists(file_path):
         os.remove(file_path)
