@@ -26,26 +26,25 @@ def extract_chunks_from_pdf(file_path, pages_per_chunk=3):
         text = page.extract_text() or ""
         current_text += text + "\n"
         if (i + 1) % pages_per_chunk == 0 or (i + 1) == total_pages:
-            if len(current_text.strip()) > 30:
-                chunks.append(current_text)
+            chunks.append((current_text, i + 1))
             current_text = ""
             
-    return chunks
+    return chunks, total_pages
 
 def process_chunk_with_ai(text_chunk):
     prompt = f"""
     Extract all questions, MCQs, or study notes/one-liners from this text and return ONLY a raw JSON array of objects.
     
-    Each object must have these keys:
+    Each object must have these exact keys:
     "question", "option_a", "option_b", "option_c", "option_d", "correct_option", "explanation", "exam", "subject", "chapter", "language"
 
-    RULES:
+    STRICT RULES:
     1. If Subject is Hindi, keep language Hindi. Otherwise translate everything to English.
     2. Convert notes/one-liners into proper 4-option MCQs.
-    3. Output ONLY the JSON array without backticks or ```json.
+    3. Output ONLY valid JSON without markdown formatting like ```json.
 
     Text:
-    {text_chunk[:8000]}
+    {text_chunk[:9000]}
     """
     try:
         response = ai_client.models.generate_content(
@@ -82,13 +81,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_path = f"/tmp/{update.message.document.file_name}"
     await file.download_to_drive(file_path)
     
-    status_msg = await update.message.reply_text("⚙️ Reading PDF and preparing batches...")
+    status_msg = await update.message.reply_text("⚙️ Reading PDF file...")
     
-    # Large PDFs handled smoothly with 3 pages per chunk
-    chunks = extract_chunks_from_pdf(file_path, pages_per_chunk=3)
-    
-    if not chunks:
-        await status_msg.edit_text("❌ Could not read text from this PDF. Please ensure it is a text-based PDF.")
+    try:
+        chunks, total_pages = extract_chunks_from_pdf(file_path, pages_per_chunk=3)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error reading PDF: {str(e)}")
         if os.path.exists(file_path):
             os.remove(file_path)
         return
@@ -97,15 +95,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     duplicate_count = 0
     total_chunks = len(chunks)
     
-    for idx, chunk in enumerate(chunks):
-        # Update progress every 2 batches to avoid Telegram Rate Limits
-        if idx % 2 == 0 or idx == total_chunks - 1:
-            try:
-                await status_msg.edit_text(f"⚙️ Processing Batch {idx+1}/{total_chunks}...\n📥 Saved so far: {saved_count}")
-            except Exception:
-                pass
-                
-        mcqs = process_chunk_with_ai(chunk)
+    for idx, (chunk_text, page_num) in enumerate(chunks):
+        # Skip if text is empty (scanned PDF image safeguard)
+        if len(chunk_text.strip()) < 20:
+            continue
+
+        try:
+            await status_msg.edit_text(f"⚙️ Processing Batch {idx+1}/{total_chunks} (Page {page_num}/{total_pages})...\n📥 Saved Questions: {saved_count}")
+        except Exception:
+            pass
+            
+        mcqs = process_chunk_with_ai(chunk_text)
         
         for item in mcqs:
             q_text = item.get("question")
@@ -133,13 +133,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 duplicate_count += 1
                 
-        # Small delay to respect Gemini AI Rate Limits
-        time.sleep(2)
+        time.sleep(1.5)
 
     if os.path.exists(file_path):
         os.remove(file_path)
         
-    await status_msg.edit_text(f"✅ Processing Complete!\n\n📥 Saved Questions: {saved_count}\n⚠️ Duplicates/Skipped: {duplicate_count}")
+    await status_msg.edit_text(f"✅ Processing Complete!\n\n📥 Total Saved: {saved_count}\n⚠️ Duplicates/Skipped: {duplicate_count}")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -154,4 +153,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
