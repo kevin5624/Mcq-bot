@@ -16,7 +16,7 @@ GEMINI_KEY = os.environ.get("GEMINI_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
-def split_pdf_by_pages(file_path, pages_per_split=4):
+def split_pdf_by_pages(file_path, pages_per_split=8):
     reader = pypdf.PdfReader(file_path)
     total_pages = len(reader.pages)
     split_files = []
@@ -50,39 +50,54 @@ def process_pdf_chunk_with_gemini(chunk_pdf_path):
     """
     
     uploaded_file = None
-    try:
-        uploaded_file = ai_client.files.upload(file=chunk_pdf_path)
-        
-        while uploaded_file.state.name == "PROCESSING":
-            time.sleep(1)
-            uploaded_file = ai_client.files.get(name=uploaded_file.name)
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            if not uploaded_file:
+                uploaded_file = ai_client.files.upload(file=chunk_pdf_path)
+                
+            while uploaded_file.state.name == "PROCESSING":
+                time.sleep(1)
+                uploaded_file = ai_client.files.get(name=uploaded_file.name)
+                
+            response = ai_client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=[uploaded_file, prompt]
+            )
             
-        # Model string corrected for google-genai SDK
-        response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[uploaded_file, prompt]
-        )
-        
-        raw_text = response.text.strip()
-        if raw_text.startswith("```json"):
-            raw_text = raw_text[7:]
-        if raw_text.startswith("```"):
-            raw_text = raw_text[3:]
-        if raw_text.endswith("```"):
-            raw_text = raw_text[:-3]
+            raw_text = response.text.strip()
+            if raw_text.startswith("```json"):
+                raw_text = raw_text[7:]
+            if raw_text.startswith("```"):
+                raw_text = raw_text[3:]
+            if raw_text.endswith("```"):
+                raw_text = raw_text[:-3]
+                
+            data = json.loads(raw_text.strip())
             
-        data = json.loads(raw_text.strip())
-        
-        ai_client.files.delete(name=uploaded_file.name)
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        print(f"Error processing PDF chunk via OCR Vision: {e}")
-        if uploaded_file:
-            try:
-                ai_client.files.delete(name=uploaded_file.name)
-            except Exception:
-                pass
-        return []
+            if uploaded_file:
+                try:
+                    ai_client.files.delete(name=uploaded_file.name)
+                except Exception:
+                    pass
+            return data if isinstance(data, list) else []
+            
+        except Exception as e:
+            err_msg = str(e)
+            print(f"Attempt {attempt+1} error: {err_msg}")
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                # Rate limit hit -> Wait 12 seconds before retry
+                time.sleep(12)
+            else:
+                time.sleep(3)
+                
+    if uploaded_file:
+        try:
+            ai_client.files.delete(name=uploaded_file.name)
+        except Exception:
+            pass
+    return []
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Hello! Send me any PDF file (including scanned or 2-column PDFs) and I will extract MCQs to your Supabase Database.")
@@ -102,7 +117,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("⚙️ Preparing PDF for AI OCR processing...")
     
     try:
-        split_chunks, total_pages = split_pdf_by_pages(file_path, pages_per_split=4)
+        split_chunks, total_pages = split_pdf_by_pages(file_path, pages_per_split=8)
     except Exception as e:
         await status_msg.edit_text(f"❌ Failed to split PDF: {str(e)}")
         if os.path.exists(file_path):
@@ -150,7 +165,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(chunk_path):
             os.remove(chunk_path)
             
-        time.sleep(2)
+        # Delay to stay within Google's Free Tier Rate Limits
+        time.sleep(5)
 
     if os.path.exists(file_path):
         os.remove(file_path)
@@ -170,3 +186,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+            
