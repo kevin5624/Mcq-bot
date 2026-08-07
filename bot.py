@@ -91,40 +91,6 @@ def build_ai_prompt(text_chunk):
     """
 
 
-def call_ai_with_fallback(text_chunk):
-    prompt = build_ai_prompt(text_chunk)
-    
-    # Provider 1: Groq AI
-    if groq_client:
-        try:
-            res = groq_client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": "You output valid raw JSON arrays only."},
-                    {"role": "user", "content": prompt}
-                ],
-                model="llama-3.1-8b-instant",
-                temperature=0.1
-            )
-            raw = res.choices[0].message.content.strip()
-            return parse_json_response(raw)
-        except Exception as e:
-            print(f"Groq Provider Failed/Limited: {e}. Falling back to Gemini...")
-
-    # Provider 2: Fallback to Gemini AI
-    if gemini_client:
-        try:
-            res = gemini_client.models.generate_content(
-                model='gemini-1.5-flash',
-                contents=prompt
-            )
-            raw = res.text.strip()
-            return parse_json_response(raw)
-        except Exception as e:
-            print(f"Gemini Fallback Failed: {e}")
-
-    return []
-
-
 def parse_json_response(raw_text):
     if raw_text.startswith("```json"):
         raw_text = raw_text[7:]
@@ -139,9 +105,46 @@ def parse_json_response(raw_text):
         return []
 
 
+def call_ai_with_fallback(prompt_or_text):
+    prompt = prompt_or_text if "OUTPUT FORMAT" in prompt_or_text else build_ai_prompt(prompt_or_text)
+    
+    # Provider 1: Groq AI
+    if groq_client:
+        try:
+            res = groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "You output valid raw JSON arrays only."},
+                    {"role": "user", "content": prompt}
+                ],
+                model="llama-3.1-8b-instant",
+                temperature=0.1
+            )
+            raw = res.choices[0].message.content.strip()
+            parsed = parse_json_response(raw)
+            if parsed:
+                return parsed
+        except Exception as e:
+            print(f"Groq Provider Failed/Limited: {e}. Falling back to Gemini...")
+
+    # Provider 2: Fallback to Gemini AI
+    if gemini_client:
+        try:
+            res = gemini_client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=prompt
+            )
+            raw = res.text.strip()
+            parsed = parse_json_response(raw)
+            if parsed:
+                return parsed
+        except Exception as e:
+            print(f"Gemini Fallback Failed: {e}")
+
+    return []
+
+
 def is_semantic_duplicate(client: Client, question_text: str) -> bool:
     try:
-        # Fetch last 30 questions to check similarity fuzzy ratio
         res = client.table("questions").select("question_text").order("id", desc=True).limit(30).execute()
         for row in res.data:
             existing_q = row.get("question_text", "")
@@ -162,7 +165,6 @@ def insert_question_into_cluster(item):
     q_hash = hashlib.sha256(q_text_clean.lower().encode()).hexdigest()
     
     subject = str(item.get("subject", "General Awareness")).strip()
-    # Enforce Hindi language only if subject is Hindi
     is_hindi_subject = "hindi" in subject.lower()
     language = "Hindi" if is_hindi_subject else "English"
 
@@ -181,7 +183,6 @@ def insert_question_into_cluster(item):
         "content_hash": q_hash
     }
 
-    # Try inserting in primary database, fallback to secondary if needed
     for client in db_clients:
         if is_semantic_duplicate(client, q_text_clean):
             return False, "duplicate"
@@ -190,47 +191,73 @@ def insert_question_into_cluster(item):
             client.table("questions").insert(data_payload).execute()
             return True, "saved"
         except Exception:
-            # Hash conflict or storage full -> Move to next DB instance in cluster
             continue
 
     return False, "duplicate_or_failed"
 
 
-# Automated Open-Source Scraper (Runs via command or schedule)
+# Open-Source Scraper with Full NCERT Verification
 def fetch_open_source_questions():
     saved = 0
     try:
         url = "https://opentdb.com/api.php?amount=10&type=multiple"
         resp = requests.get(url, timeout=10).json()
         if resp.get("response_code") == 0:
+            raw_questions = []
             for item in resp.get("results", []):
-                q_item = {
+                raw_questions.append({
                     "question": item.get("question"),
-                    "option_a": item.get("correct_answer"),
-                    "option_b": item.get("incorrect_answers")[0] if len(item.get("incorrect_answers")) > 0 else "N/A",
-                    "option_c": item.get("incorrect_answers")[1] if len(item.get("incorrect_answers")) > 1 else "N/A",
-                    "option_d": item.get("incorrect_answers")[2] if len(item.get("incorrect_answers")) > 2 else "N/A",
-                    "correct_option": "A",
-                    "explanation": f"Source: OpenTDB Category - {item.get('category')}",
-                    "exam": "General Quiz",
-                    "subject": item.get("category", "General Knowledge"),
-                    "chapter": "Misc"
-                }
-                status, _ = insert_question_into_cluster(q_item)
+                    "given_answer": item.get("correct_answer"),
+                    "options": item.get("incorrect_answers") + [item.get("correct_answer")],
+                    "category": item.get("category")
+                })
+            
+            prompt = f"""
+            You are an NCERT Curriculum Verifier. 
+            Verify these open-source internet questions against NCERT / Standard Academic Syllabus facts.
+            
+            Tasks:
+            1. Correct any wrong answers according to NCERT facts.
+            2. Make sure wrong options are contextually relevant to the question topic.
+            3. Translate non-Hindi questions to English. Keep Hindi literature in Hindi.
+
+            OUTPUT FORMAT (Strict Raw JSON Array ONLY):
+            [
+              {{
+                "question": "Question text",
+                "option_a": "Correct NCERT Verified Answer",
+                "option_b": "Contextual wrong option 1",
+                "option_c": "Contextual wrong option 2",
+                "option_d": "Contextual wrong option 3",
+                "correct_option": "A",
+                "explanation": "NCERT Verified concept summary",
+                "exam": "Competitive Exams",
+                "subject": "General Knowledge",
+                "chapter": "Misc"
+              }}
+            ]
+
+            Data to verify:
+            {json.dumps(raw_questions)}
+            """
+            
+            verified_mcqs = call_ai_with_fallback(prompt)
+            for item in verified_mcqs:
+                status, _ = insert_question_into_cluster(item)
                 if status:
                     saved += 1
     except Exception as e:
-        print(f"Scraper Error: {e}")
+        print(f"Verified Scraper Error: {e}")
     return saved
 
 
-# Telegram Handlers
+# Telegram Commands & Message Handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 **Multi-DB MCQ Ingestion Bot Active!**\n\n"
         "📁 Upload any PDF (up to 100MB).\n"
         "📊 Type `/stats` to see detailed category & DB analytics.\n"
-        "🌐 Type `/scrape` to auto-fetch open-source questions."
+        "🌐 Type `/scrape` to auto-fetch NCERT-verified open-source questions."
     )
 
 
@@ -256,9 +283,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🌐 Fetching open-source questions...")
+    msg = await update.message.reply_text("🌐 Fetching open-source questions & verifying with NCERT Syllabus...")
     saved = fetch_open_source_questions()
-    await msg.edit_text(f"✅ Scraped & Saved `{saved}` new unique open-source questions into Cluster!")
+    await msg.edit_text(f"✅ Scraped, NCERT Verified & Saved `{saved}` new unique questions into Cluster!")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -277,7 +304,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chunks, total_pages = extract_text_chunks_large_pdf(file_path, pages_per_chunk=3)
     except Exception as e:
         await status_msg.edit_text(f"❌ Failed to extract PDF: {str(e)}")
-        if os.path.exists(file_path): os.remove(file_path)
+        if os.path.exists(file_path): 
+            os.remove(file_path)
         return
 
     saved_count = 0
@@ -327,4 +355,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+        
