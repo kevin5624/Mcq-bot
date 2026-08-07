@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import requests
+import asyncio
 import pypdf
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -32,6 +33,9 @@ if SUPABASE_URL_2 and SUPABASE_KEY_2:
 # AI Clients
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 gemini_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
+
+# Async Queue for Sequential Multi-File Batch Processing
+file_queue = asyncio.Queue()
 
 
 def extract_text_chunks_large_pdf(file_path, pages_per_chunk=3):
@@ -196,68 +200,140 @@ def insert_question_into_cluster(item):
     return False, "duplicate_or_failed"
 
 
-# Open-Source Scraper with Full NCERT Verification
-def fetch_open_source_questions():
+# Open-Source Bulk Scraper (500+ NCERT Verified Questions)
+def fetch_open_source_questions(target_count=500):
     saved = 0
-    try:
-        url = "https://opentdb.com/api.php?amount=10&type=multiple"
-        resp = requests.get(url, timeout=10).json()
-        if resp.get("response_code") == 0:
-            raw_questions = []
-            for item in resp.get("results", []):
-                raw_questions.append({
-                    "question": item.get("question"),
-                    "given_answer": item.get("correct_answer"),
-                    "options": item.get("incorrect_answers") + [item.get("correct_answer")],
-                    "category": item.get("category")
-                })
+    batch_size = 50
+    loops = target_count // batch_size
+    
+    for loop_idx in range(loops):
+        try:
+            url = f"https://opentdb.com/api.php?amount={batch_size}&type=multiple"
+            resp = requests.get(url, timeout=12).json()
             
-            prompt = f"""
-            You are an NCERT Curriculum Verifier. 
-            Verify these open-source internet questions against NCERT / Standard Academic Syllabus facts.
-            
-            Tasks:
-            1. Correct any wrong answers according to NCERT facts.
-            2. Make sure wrong options are contextually relevant to the question topic.
-            3. Translate non-Hindi questions to English. Keep Hindi literature in Hindi.
+            if resp.get("response_code") == 0:
+                raw_questions = []
+                for item in resp.get("results", []):
+                    raw_questions.append({
+                        "question": item.get("question"),
+                        "given_answer": item.get("correct_answer"),
+                        "options": item.get("incorrect_answers") + [item.get("correct_answer")],
+                        "category": item.get("category")
+                    })
+                
+                prompt = f"""
+                You are an NCERT Curriculum Verifier. 
+                Verify these open-source internet questions against NCERT / Standard Academic Syllabus facts.
+                
+                Tasks:
+                1. Correct any wrong answers according to NCERT facts.
+                2. Make sure wrong options are contextually relevant to the question topic.
+                3. Translate non-Hindi questions to English. Keep Hindi literature in Hindi.
 
-            OUTPUT FORMAT (Strict Raw JSON Array ONLY):
-            [
-              {{
-                "question": "Question text",
-                "option_a": "Correct NCERT Verified Answer",
-                "option_b": "Contextual wrong option 1",
-                "option_c": "Contextual wrong option 2",
-                "option_d": "Contextual wrong option 3",
-                "correct_option": "A",
-                "explanation": "NCERT Verified concept summary",
-                "exam": "Competitive Exams",
-                "subject": "General Knowledge",
-                "chapter": "Misc"
-              }}
-            ]
+                OUTPUT FORMAT (Strict Raw JSON Array ONLY):
+                [
+                  {{
+                    "question": "Question text",
+                    "option_a": "Correct NCERT Verified Answer",
+                    "option_b": "Contextual wrong option 1",
+                    "option_c": "Contextual wrong option 2",
+                    "option_d": "Contextual wrong option 3",
+                    "correct_option": "A",
+                    "explanation": "NCERT Verified concept summary",
+                    "exam": "Competitive Exams",
+                    "subject": "General Knowledge",
+                    "chapter": "Misc"
+                  }}
+                ]
 
-            Data to verify:
-            {json.dumps(raw_questions)}
-            """
+                Data to verify:
+                {json.dumps(raw_questions)}
+                """
+                
+                verified_mcqs = call_ai_with_fallback(prompt)
+                for item in verified_mcqs:
+                    status, _ = insert_question_into_cluster(item)
+                    if status:
+                        saved += 1
+                        
+            time.sleep(3)
             
-            verified_mcqs = call_ai_with_fallback(prompt)
-            for item in verified_mcqs:
-                status, _ = insert_question_into_cluster(item)
-                if status:
-                    saved += 1
-    except Exception as e:
-        print(f"Verified Scraper Error: {e}")
+        except Exception as e:
+            print(f"Scraper Batch {loop_idx+1} Error: {e}")
+            time.sleep(4)
+            
     return saved
+
+
+# Background Worker To Process PDF File Queue Sequentially
+async def file_queue_worker():
+    while True:
+        update, context, file_id, file_name, file_size = await file_queue.get()
+        try:
+            file = await context.bot.get_file(file_id)
+            file_path = f"/tmp/{file_name}"
+            await file.download_to_drive(file_path)
+            
+            status_msg = await update.message.reply_text(f"⚙️ **Processing File from Queue:** `{file_name}`...")
+            
+            try:
+                chunks, total_pages = extract_text_chunks_large_pdf(file_path, pages_per_chunk=3)
+            except Exception as e:
+                await status_msg.edit_text(f"❌ Failed to extract PDF `{file_name}`: {str(e)}")
+                if os.path.exists(file_path): 
+                    os.remove(file_path)
+                file_queue.task_done()
+                continue
+
+            saved_count = 0
+            duplicate_count = 0
+            total_splits = len(chunks)
+
+            for idx, (chunk_text, page_num) in enumerate(chunks):
+                try:
+                    await status_msg.edit_text(
+                        f"⚙️ **Processing `{file_name}`**\n"
+                        f"Batch {idx+1}/{total_splits} (Page {page_num}/{total_pages})\n"
+                        f"📥 **Saved:** `{saved_count}` | ⚠️ **Duplicates Skipped:** `{duplicate_count}`"
+                    )
+                except Exception:
+                    pass
+
+                mcqs = call_ai_with_fallback(chunk_text)
+                
+                for item in mcqs:
+                    status, flag = insert_question_into_cluster(item)
+                    if status:
+                        saved_count += 1
+                    elif flag in ["duplicate", "duplicate_or_failed"]:
+                        duplicate_count += 1
+
+                time.sleep(1.5)
+
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+            queue_remaining = file_queue.qsize()
+            await status_msg.edit_text(
+                f"✅ **Finished `{file_name}`!**\n\n"
+                f"📥 **NCERT Verified Saved:** `{saved_count}`\n"
+                f"⚠️ **Duplicates Skipped:** `{duplicate_count}`\n"
+                f"🔄 **Remaining Queue:** `{queue_remaining}` files"
+            )
+
+        except Exception as err:
+            print(f"Error processing file {file_name}: {err}")
+        finally:
+            file_queue.task_done()
 
 
 # Telegram Commands & Message Handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 **Multi-DB MCQ Ingestion Bot Active!**\n\n"
-        "📁 Upload any PDF (up to 100MB).\n"
+        "📁 Upload multiple PDFs (up to 100MB each) - Queue will process sequentially.\n"
         "📊 Type `/stats` to see detailed category & DB analytics.\n"
-        "🌐 Type `/scrape` to auto-fetch NCERT-verified open-source questions."
+        "🌐 Type `/scrape` to auto-fetch 500+ NCERT-verified open-source questions."
     )
 
 
@@ -276,70 +352,33 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     response_msg = (
         f"📊 **Cluster Stats Summary**\n"
-        f"🌐 **Total Questions:** `{total_q}`\n\n"
+        f"🌐 **Total Questions:** `{total_q}`\n"
+        f"🔄 **Pending Files in Queue:** `{file_queue.qsize()}`\n\n"
         f"💾 **Database Storage Distribution:**\n" + "\n".join(db_breakdown)
     )
     await update.message.reply_text(response_msg, parse_mode="Markdown")
 
 
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🌐 Fetching open-source questions & verifying with NCERT Syllabus...")
-    saved = fetch_open_source_questions()
-    await msg.edit_text(f"✅ Scraped, NCERT Verified & Saved `{saved}` new unique questions into Cluster!")
+    msg = await update.message.reply_text("🌐 Starting Open-Source Bulk Scraper (Target: 500+ NCERT Verified Questions)...")
+    saved = fetch_open_source_questions(target_count=500)
+    await msg.edit_text(f"✅ Auto-Run Complete!\n\n📥 **Total NCERT Verified Questions Saved:** `{saved}`")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if doc.file_size > 100 * 1024 * 1024:
-        await update.message.reply_text("❌ File exceeds maximum limit of 100MB.")
+        await update.message.reply_text(f"❌ File `{doc.file_name}` exceeds 100MB limit.")
         return
 
-    file = await doc.get_file()
-    file_path = f"/tmp/{doc.file_name}"
-    await file.download_to_drive(file_path)
+    # Add file to processing queue
+    await file_queue.put((update, context, doc.file_id, doc.file_name, doc.file_size))
     
-    status_msg = await update.message.reply_text("⚙️ **Reading PDF & Rotating AI Providers...**")
-    
-    try:
-        chunks, total_pages = extract_text_chunks_large_pdf(file_path, pages_per_chunk=3)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Failed to extract PDF: {str(e)}")
-        if os.path.exists(file_path): 
-            os.remove(file_path)
-        return
-
-    saved_count = 0
-    duplicate_count = 0
-    total_splits = len(chunks)
-
-    for idx, (chunk_text, page_num) in enumerate(chunks):
-        try:
-            await status_msg.edit_text(
-                f"⚙️ **Processing Batch {idx+1}/{total_splits} (Page {page_num}/{total_pages})**\n"
-                f"📥 **Saved:** `{saved_count}` | ⚠️ **Duplicates Skipped:** `{duplicate_count}`"
-            )
-        except Exception:
-            pass
-
-        mcqs = call_ai_with_fallback(chunk_text)
-        
-        for item in mcqs:
-            status, flag = insert_question_into_cluster(item)
-            if status:
-                saved_count += 1
-            elif flag in ["duplicate", "duplicate_or_failed"]:
-                duplicate_count += 1
-
-        time.sleep(1.5)
-
-    if os.path.exists(file_path):
-        os.remove(file_path)
-
-    await status_msg.edit_text(
-        f"✅ **PDF Processing Complete!**\n\n"
-        f"📥 **NCERT Verified Questions Saved:** `{saved_count}`\n"
-        f"⚠️ **Duplicates/Skipped Avoided:** `{duplicate_count}`"
-    )
+    q_size = file_queue.qsize()
+    if q_size == 1:
+        await update.message.reply_text(f"📥 Received `{doc.file_name}`. Processing started...")
+    else:
+        await update.message.reply_text(f"📥 Received `{doc.file_name}`. Added to Queue (Position #{q_size}).")
 
 
 def main():
@@ -350,9 +389,12 @@ def main():
     app.add_handler(CommandHandler("scrape", scrape_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
-    print("Bot Cluster Running...")
+    # Start background task worker for async queue
+    loop = asyncio.get_event_loop()
+    loop.create_task(file_queue_worker())
+    
+    print("Bot Cluster Running with Async File Queue...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-        
