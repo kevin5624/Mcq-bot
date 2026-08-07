@@ -6,7 +6,6 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from supabase import create_client
 import google.generativeai as genai
-from sentence_transformers import SentenceTransformer
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -16,7 +15,17 @@ GEMINI_KEY = os.environ.get("GEMINI_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 genai.configure(api_key=GEMINI_KEY)
 model_ai = genai.GenerativeModel('gemini-1.5-flash')
-embedder = SentenceTransformer('all-MiniLM-L6-v2')
+
+def get_embedding(text):
+    try:
+        res = genai.embed_content(
+            model="models/text-embedding-004",
+            content=text,
+            task_type="retrieval_document"
+        )
+        return res['embedding'][:384]  # Trim to fit 384 vector dimension
+    except Exception as e:
+        return [0.0] * 384
 
 def extract_text_from_pdf(file_path):
     reader = pypdf.PdfReader(file_path)
@@ -49,15 +58,25 @@ def process_with_ai(text):
     try:
         clean_json = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(clean_json)
-    except:
+    except Exception:
         return []
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Hello! Send me any PDF file (MCQs, Notes, One-liners) and I will extract, clean, translate, and save questions to Supabase Database.")
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        res = supabase.table("questions").select("id", count="exact").execute()
+        await update.message.reply_text(f"📊 Total Questions in Database: {res.count}")
+    except Exception as e:
+        await update.message.reply_text(f"Error fetching stats: {str(e)}")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await update.message.document.get_file()
     file_path = f"/tmp/{update.message.document.file_name}"
     await file.download_to_drive(file_path)
     
-    await update.message.reply_text("Processing PDF with AI...")
+    await update.message.reply_text("⚙️ Processing PDF with AI...")
     
     text = extract_text_from_pdf(file_path)
     mcqs = process_with_ai(text)
@@ -71,17 +90,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
             
         q_hash = hashlib.sha256(q_text.encode()).hexdigest()
-        vector = embedder.encode(q_text).tolist()
+        vector = get_embedding(q_text)
         
-        sim_check = supabase.rpc("match_questions", {
-            "query_embedding": vector,
-            "match_threshold": 0.85,
-            "match_count": 1
-        }).execute()
-        
-        if len(sim_check.data) > 0:
-            duplicate_count += 1
-            continue
+        try:
+            sim_check = supabase.rpc("match_questions", {
+                "query_embedding": vector,
+                "match_threshold": 0.85,
+                "match_count": 1
+            }).execute()
+            
+            if len(sim_check.data) > 0:
+                duplicate_count += 1
+                continue
+        except Exception:
+            pass
             
         try:
             supabase.table("questions").insert({
@@ -106,18 +128,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if os.path.exists(file_path):
         os.remove(file_path)
         
-    await update.message.reply_text(f"Processing Complete!\nSaved: {saved_count}\nDuplicates Avoided: {duplicate_count}")
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    res = supabase.table("questions").select("id", count="exact").execute()
-    await update.message.reply_text(f"Total Questions in Database: {res.count}")
+    await update.message.reply_text(f"✅ Processing Complete!\n\n📥 Saved: {saved_count}\n⚠️ Duplicates Avoided: {duplicate_count}")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("status", stats_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+    print("Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-
+    
