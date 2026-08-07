@@ -5,7 +5,7 @@ import pypdf
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from supabase import create_client
-import google.generativeai as genai
+from google import genai
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -13,19 +13,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_KEY = os.environ.get("GEMINI_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-genai.configure(api_key=GEMINI_KEY)
-model_ai = genai.GenerativeModel('gemini-1.5-flash')
-
-def get_embedding(text):
-    try:
-        res = genai.embed_content(
-            model="models/text-embedding-004",
-            content=text,
-            task_type="retrieval_document"
-        )
-        return res['embedding'][:384]  # Trim to fit 384 vector dimension
-    except Exception as e:
-        return [0.0] * 384
+ai_client = genai.Client(api_key=GEMINI_KEY)
 
 def extract_text_from_pdf(file_path):
     reader = pypdf.PdfReader(file_path)
@@ -54,11 +42,15 @@ def process_with_ai(text):
     
     Text: {text[:8000]}
     """
-    response = model_ai.generate_content(prompt)
     try:
+        response = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
         clean_json = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(clean_json)
-    except Exception:
+    except Exception as e:
+        print(f"AI Processing Error: {e}")
         return []
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -90,21 +82,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
             
         q_hash = hashlib.sha256(q_text.encode()).hexdigest()
-        vector = get_embedding(q_text)
         
-        try:
-            sim_check = supabase.rpc("match_questions", {
-                "query_embedding": vector,
-                "match_threshold": 0.85,
-                "match_count": 1
-            }).execute()
-            
-            if len(sim_check.data) > 0:
-                duplicate_count += 1
-                continue
-        except Exception:
-            pass
-            
         try:
             supabase.table("questions").insert({
                 "question_text": q_text,
@@ -118,8 +96,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "subject_name": item.get("subject", "General"),
                 "chapter_name": item.get("chapter", "General"),
                 "language": item.get("language", "English"),
-                "content_hash": q_hash,
-                "embedding": vector
+                "content_hash": q_hash
             }).execute()
             saved_count += 1
         except Exception:
@@ -143,4 +120,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
