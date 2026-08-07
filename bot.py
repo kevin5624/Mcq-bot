@@ -16,43 +16,55 @@ GEMINI_KEY = os.environ.get("GEMINI_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
-def extract_chunks_from_pdf(file_path, pages_per_chunk=3):
+def split_pdf_by_pages(file_path, pages_per_split=4):
     reader = pypdf.PdfReader(file_path)
     total_pages = len(reader.pages)
-    chunks = []
+    split_files = []
     
-    current_text = ""
-    for i, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        current_text += text + "\n"
-        if (i + 1) % pages_per_chunk == 0 or (i + 1) == total_pages:
-            chunks.append((current_text, i + 1))
-            current_text = ""
+    for i in range(0, total_pages, pages_per_split):
+        writer = pypdf.PdfWriter()
+        end_page = min(i + pages_per_split, total_pages)
+        for page_idx in range(i, end_page):
+            writer.add_page(reader.pages[page_idx])
             
-    return chunks, total_pages
+        temp_chunk_path = f"/tmp/chunk_{i}_{end_page}.pdf"
+        with open(temp_chunk_path, "wb") as f:
+            writer.write(f)
+        split_files.append((temp_chunk_path, i+1, end_page))
+        
+    return split_files, total_pages
 
-def process_chunk_with_ai(text_chunk):
-    prompt = f"""
-    Extract all questions, MCQs, or study notes/one-liners from this text and return ONLY a raw JSON array of objects.
+def process_pdf_chunk_with_gemini(chunk_pdf_path):
+    prompt = """
+    Analyze this PDF pages directly (including two-column layouts, scanned images, and text).
+    Extract all questions, MCQs, or study notes/one-liners and return ONLY a raw JSON array of objects.
     
     Each object must have these exact keys:
     "question", "option_a", "option_b", "option_c", "option_d", "correct_option", "explanation", "exam", "subject", "chapter", "language"
 
     STRICT RULES:
-    1. If Subject is Hindi, keep language Hindi. Otherwise translate everything to English.
-    2. Convert notes/one-liners into proper 4-option MCQs.
-    3. Output ONLY valid JSON without markdown formatting like ```json.
-
-    Text:
-    {text_chunk[:9000]}
+    1. Handle 2-column or multi-column layouts carefully so question reading order is maintained.
+    2. If Subject is Hindi, keep language Hindi. Otherwise translate everything to English.
+    3. Convert one-liners or notes into proper 4-option MCQs logically.
+    4. Return ONLY the raw JSON array. Do not add markdown like ```json or any extra text.
     """
+    
+    uploaded_file = None
     try:
+        # Direct Gemini Native File Upload (OCR & Vision Capable)
+        uploaded_file = ai_client.files.upload(file=chunk_pdf_path)
+        
+        # Wait until file is processed by Gemini
+        while uploaded_file.state.name == "PROCESSING":
+            time.sleep(1)
+            uploaded_file = ai_client.files.get(name=uploaded_file.name)
+            
         response = ai_client.models.generate_content(
             model='gemini-1.5-flash',
-            contents=prompt
+            contents=[uploaded_file, prompt]
         )
-        raw_text = response.text.strip()
         
+        raw_text = response.text.strip()
         if raw_text.startswith("```json"):
             raw_text = raw_text[7:]
         if raw_text.startswith("```"):
@@ -61,13 +73,21 @@ def process_chunk_with_ai(text_chunk):
             raw_text = raw_text[:-3]
             
         data = json.loads(raw_text.strip())
+        
+        # Cleanup file from Gemini servers
+        ai_client.files.delete(name=uploaded_file.name)
         return data if isinstance(data, list) else []
     except Exception as e:
-        print(f"Error processing chunk: {e}")
+        print(f"Error processing PDF chunk via OCR Vision: {e}")
+        if uploaded_file:
+            try:
+                ai_client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
         return []
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Hello! Send me any PDF file and I will extract and save MCQs directly to your Supabase Database.")
+    await update.message.reply_text("👋 Hello! Send me any PDF file (including scanned or 2-column PDFs) and I will extract MCQs to your Supabase Database.")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -81,31 +101,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_path = f"/tmp/{update.message.document.file_name}"
     await file.download_to_drive(file_path)
     
-    status_msg = await update.message.reply_text("⚙️ Reading PDF file...")
+    status_msg = await update.message.reply_text("⚙️ Preparing PDF for AI OCR processing...")
     
     try:
-        chunks, total_pages = extract_chunks_from_pdf(file_path, pages_per_chunk=3)
+        split_chunks, total_pages = split_pdf_by_pages(file_path, pages_per_split=4)
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error reading PDF: {str(e)}")
+        await status_msg.edit_text(f"❌ Failed to split PDF: {str(e)}")
         if os.path.exists(file_path):
             os.remove(file_path)
         return
 
     saved_count = 0
     duplicate_count = 0
-    total_chunks = len(chunks)
+    total_splits = len(split_chunks)
     
-    for idx, (chunk_text, page_num) in enumerate(chunks):
-        # Skip if text is empty (scanned PDF image safeguard)
-        if len(chunk_text.strip()) < 20:
-            continue
-
+    for idx, (chunk_path, start_p, end_p) in enumerate(split_chunks):
         try:
-            await status_msg.edit_text(f"⚙️ Processing Batch {idx+1}/{total_chunks} (Page {page_num}/{total_pages})...\n📥 Saved Questions: {saved_count}")
+            await status_msg.edit_text(f"⚙️ Processing Pages {start_p}-{end_p} of {total_pages} (Batch {idx+1}/{total_splits})...\n📥 Saved Questions: {saved_count}")
         except Exception:
             pass
             
-        mcqs = process_chunk_with_ai(chunk_text)
+        mcqs = process_pdf_chunk_with_gemini(chunk_path)
         
         for item in mcqs:
             q_text = item.get("question")
@@ -132,13 +148,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 saved_count += 1
             except Exception:
                 duplicate_count += 1
-                
-        time.sleep(1.5)
+
+        if os.path.exists(chunk_path):
+            os.remove(chunk_path)
+            
+        time.sleep(2)
 
     if os.path.exists(file_path):
         os.remove(file_path)
         
-    await status_msg.edit_text(f"✅ Processing Complete!\n\n📥 Total Saved: {saved_count}\n⚠️ Duplicates/Skipped: {duplicate_count}")
+    await status_msg.edit_text(f"✅ Processing Complete!\n\n📥 Saved Questions: {saved_count}\n⚠️ Duplicates/Skipped: {duplicate_count}")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -153,3 +172,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
