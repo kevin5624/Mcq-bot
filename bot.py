@@ -2,9 +2,9 @@ import os
 import time
 import hashlib
 import json
-import re
 import requests
 import asyncio
+import html
 import pypdf
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -13,7 +13,7 @@ from groq import Groq
 from google import genai
 from thefuzz import fuzz
 
-# Environment Variables & API Clients Setup
+# Environment Variables Setup
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_KEY = os.environ.get("GEMINI_KEY")
@@ -23,7 +23,7 @@ SUPABASE_KEY_1 = os.environ.get("SUPABASE_KEY_1")
 SUPABASE_URL_2 = os.environ.get("SUPABASE_URL_2")
 SUPABASE_KEY_2 = os.environ.get("SUPABASE_KEY_2")
 
-# Database Clients Cluster
+# Database Cluster Setup
 db_clients = []
 if SUPABASE_URL_1 and SUPABASE_KEY_1:
     db_clients.append(create_client(SUPABASE_URL_1, SUPABASE_KEY_1))
@@ -34,7 +34,6 @@ if SUPABASE_URL_2 and SUPABASE_KEY_2:
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 gemini_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
-# Async Queue for Sequential Multi-File Batch Processing
 file_queue = asyncio.Queue()
 
 
@@ -61,28 +60,28 @@ def build_ai_prompt(text_chunk):
     Extract all MCQs, One-Liners, Notes, or Q&A tables from the text below.
 
     RULES FOR CATEGORIZATION & TRANSLATION:
-    1. Identify 'exam_name', 'subject_name', and 'chapter_name' automatically from the context.
+    1. Identify 'exam_name', 'subject_name', and 'chapter_name' automatically from context.
     2. LANGUAGE RULE:
-       - If 'subject_name' is Hindi / Hindi Literature, keep the question and options in HINDI.
-       - Otherwise, translate everything (Hindi/Other languages) to clear ENGLISH.
+       - If 'subject_name' is Hindi / Hindi Literature, keep question & options in HINDI.
+       - Otherwise, translate everything to clear ENGLISH.
     3. ONE-LINERS / NOTES TO MCQ CONVERSION:
-       - Place the correct answer in 'option_a' (correct_option="A").
-       - Generate 3 WRONG OPTIONS (option_b, option_c, option_d) that are STRICTLY CONTEXTUALLY RELATED to the topic.
+       - Place correct answer in 'option_a' (correct_option="A").
+       - Generate 3 WRONG OPTIONS (option_b, option_c, option_d) strictly CONTEXTUALLY RELATED to the topic.
     4. NCERT VERIFICATION:
        - Cross-check answers with NCERT Syllabus (Class 6th-12th). Correct any mistakes and state reason in 'explanation'.
 
     OUTPUT FORMAT (Raw JSON Array ONLY):
     [
       {{
-        "question": "Question text here",
+        "question": "Question text",
         "option_a": "Option A text",
         "option_b": "Option B text",
         "option_c": "Option C text",
         "option_d": "Option D text",
         "correct_option": "A",
         "explanation": "NCERT Verified concept summary",
-        "exam": "Exam Name (e.g. UPSC, SSC, General)",
-        "subject": "Subject Name (e.g. History, Science, Hindi)",
+        "exam": "Exam Name",
+        "subject": "Subject Name",
         "chapter": "Chapter Name",
         "language": "English or Hindi"
       }}
@@ -109,10 +108,10 @@ def parse_json_response(raw_text):
         return []
 
 
-def call_ai_with_fallback(prompt_or_text):
-    prompt = prompt_or_text if "OUTPUT FORMAT" in prompt_or_text else build_ai_prompt(prompt_or_text)
+def call_ai_with_fallback(prompt_text):
+    prompt = prompt_text if "OUTPUT FORMAT" in prompt_text else build_ai_prompt(prompt_text)
     
-    # Provider 1: Groq AI
+    # Try Groq AI First
     if groq_client:
         try:
             res = groq_client.chat.completions.create(
@@ -128,13 +127,13 @@ def call_ai_with_fallback(prompt_or_text):
             if parsed:
                 return parsed
         except Exception as e:
-            print(f"Groq Provider Failed/Limited: {e}. Falling back to Gemini...")
+            print(f"Groq Limit/Error: {e}. Switching to Gemini AI Fallback...")
 
-    # Provider 2: Fallback to Gemini AI
+    # Fallback to Gemini AI
     if gemini_client:
         try:
             res = gemini_client.models.generate_content(
-                model='gemini-1.5-flash',
+                model='gemini-2.5-flash',
                 contents=prompt
             )
             raw = res.text.strip()
@@ -142,7 +141,7 @@ def call_ai_with_fallback(prompt_or_text):
             if parsed:
                 return parsed
         except Exception as e:
-            print(f"Gemini Fallback Failed: {e}")
+            print(f"Gemini Fallback Error: {e}")
 
     return []
 
@@ -153,7 +152,7 @@ def is_semantic_duplicate(client: Client, question_text: str) -> bool:
         for row in res.data:
             existing_q = row.get("question_text", "")
             ratio = fuzz.ratio(question_text.lower(), existing_q.lower())
-            if ratio > 85:  # 85% similarity threshold
+            if ratio > 85:
                 return True
     except Exception:
         pass
@@ -168,7 +167,7 @@ def insert_question_into_cluster(item):
     q_text_clean = str(q_text).strip()
     q_hash = hashlib.sha256(q_text_clean.lower().encode()).hexdigest()
     
-    subject = str(item.get("subject", "General Awareness")).strip()
+    subject = str(item.get("subject", "General Knowledge")).strip()
     is_hindi_subject = "hindi" in subject.lower()
     language = "Hindi" if is_hindi_subject else "English"
 
@@ -179,8 +178,8 @@ def insert_question_into_cluster(item):
         "option_c": str(item.get("option_c", "N/A")),
         "option_d": str(item.get("option_d", "N/A")),
         "correct_option": str(item.get("correct_option", "A")).upper()[:1],
-        "explanation": str(item.get("explanation", "NCERT Verified.")),
-        "exam_name": str(item.get("exam", "General")),
+        "explanation": str(item.get("explanation", "Verified with NCERT Standards.")),
+        "exam_name": str(item.get("exam", "Competitive Exams")),
         "subject_name": subject,
         "chapter_name": str(item.get("chapter", "General")),
         "language": language,
@@ -200,10 +199,10 @@ def insert_question_into_cluster(item):
     return False, "duplicate_or_failed"
 
 
-# Open-Source Bulk Scraper (500+ NCERT Verified Questions)
-def fetch_open_source_questions(target_count=500):
+# Token-Optimized NCERT Verified Bulk Open-Source Scraper
+def fetch_open_source_questions_ncert_verified(target_count=500):
     saved = 0
-    batch_size = 50
+    batch_size = 20  # Optimized 20-item batches to prevent token limits
     loops = target_count // batch_size
     
     for loop_idx in range(loops):
@@ -215,38 +214,40 @@ def fetch_open_source_questions(target_count=500):
                 raw_questions = []
                 for item in resp.get("results", []):
                     raw_questions.append({
-                        "question": item.get("question"),
-                        "given_answer": item.get("correct_answer"),
-                        "options": item.get("incorrect_answers") + [item.get("correct_answer")],
-                        "category": item.get("category")
+                        "question": html.unescape(item.get("question", "")),
+                        "given_answer": html.unescape(item.get("correct_answer", "")),
+                        "wrong_options": [html.unescape(x) for x in item.get("incorrect_answers", [])],
+                        "category": html.unescape(item.get("category", ""))
                     })
                 
+                # Compact AI Prompt for NCERT Verification
                 prompt = f"""
-                You are an NCERT Curriculum Verifier. 
-                Verify these open-source internet questions against NCERT / Standard Academic Syllabus facts.
+                You are an NCERT Curriculum Verifier.
+                Verify these internet questions against NCERT/Academic facts.
                 
-                Tasks:
+                RULES:
                 1. Correct any wrong answers according to NCERT facts.
-                2. Make sure wrong options are contextually relevant to the question topic.
-                3. Translate non-Hindi questions to English. Keep Hindi literature in Hindi.
+                2. Ensure wrong options are contextually relevant to question topic.
+                3. Set correct_option="A" with NCERT answer in option_a.
+                4. Keep language English (unless subject is Hindi).
 
                 OUTPUT FORMAT (Strict Raw JSON Array ONLY):
                 [
                   {{
                     "question": "Question text",
-                    "option_a": "Correct NCERT Verified Answer",
+                    "option_a": "NCERT Verified Correct Answer",
                     "option_b": "Contextual wrong option 1",
                     "option_c": "Contextual wrong option 2",
                     "option_d": "Contextual wrong option 3",
                     "correct_option": "A",
-                    "explanation": "NCERT Verified concept summary",
-                    "exam": "Competitive Exams",
+                    "explanation": "NCERT Verification: Brief concept note",
+                    "exam": "General Exams",
                     "subject": "General Knowledge",
                     "chapter": "Misc"
                   }}
                 ]
 
-                Data to verify:
+                Raw Data:
                 {json.dumps(raw_questions)}
                 """
                 
@@ -256,16 +257,15 @@ def fetch_open_source_questions(target_count=500):
                     if status:
                         saved += 1
                         
-            time.sleep(3)
+            time.sleep(2)  # Short pause
             
         except Exception as e:
-            print(f"Scraper Batch {loop_idx+1} Error: {e}")
-            time.sleep(4)
+            print(f"Verified Scraper Batch {loop_idx+1} Error: {e}")
+            time.sleep(3)
             
     return saved
 
 
-# Background Worker To Process PDF File Queue Sequentially
 async def file_queue_worker():
     while True:
         update, context, file_id, file_name, file_size = await file_queue.get()
@@ -327,10 +327,9 @@ async def file_queue_worker():
             file_queue.task_done()
 
 
-# Telegram Commands & Message Handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 **Multi-DB MCQ Ingestion Bot Active!**\n\n"
+        "👋 **NCERT-Verified MCQ Cluster Bot Active!**\n\n"
         "📁 Upload multiple PDFs (up to 100MB each) - Queue will process sequentially.\n"
         "📊 Type `/stats` to see detailed category & DB analytics.\n"
         "🌐 Type `/scrape` to auto-fetch 500+ NCERT-verified open-source questions."
@@ -360,9 +359,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🌐 Starting Open-Source Bulk Scraper (Target: 500+ NCERT Verified Questions)...")
-    saved = fetch_open_source_questions(target_count=500)
-    await msg.edit_text(f"✅ Auto-Run Complete!\n\n📥 **Total NCERT Verified Questions Saved:** `{saved}`")
+    msg = await update.message.reply_text("🌐 Starting NCERT-Verified Open-Source Scraper (Target: 500+ Questions)...")
+    saved = fetch_open_source_questions_ncert_verified(target_count=500)
+    await msg.edit_text(f"✅ Auto-Run Scraper Complete!\n\n📥 **NCERT Verified Questions Saved:** `{saved}`")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -371,7 +370,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ File `{doc.file_name}` exceeds 100MB limit.")
         return
 
-    # Add file to processing queue
     await file_queue.put((update, context, doc.file_id, doc.file_name, doc.file_size))
     
     q_size = file_queue.qsize()
@@ -389,12 +387,12 @@ def main():
     app.add_handler(CommandHandler("scrape", scrape_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
-    # Start background task worker for async queue
     loop = asyncio.get_event_loop()
     loop.create_task(file_queue_worker())
     
-    print("Bot Cluster Running with Async File Queue...")
+    print("Bot Cluster Running...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+    
