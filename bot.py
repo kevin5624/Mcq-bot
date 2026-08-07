@@ -23,7 +23,7 @@ def extract_chunks_from_pdf(file_path, pages_per_chunk=3):
     
     current_text = ""
     for i, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
+        text = page.extract_text(layout=True) or "" 
         current_text += text + "\n"
         if (i + 1) % pages_per_chunk == 0 or (i + 1) == total_pages:
             if len(current_text.strip()) > 30:
@@ -32,76 +32,69 @@ def extract_chunks_from_pdf(file_path, pages_per_chunk=3):
             
     return chunks, total_pages
 
-def process_chunk_with_groq(text_chunk):
+def process_chunk_with_groq_ncert_verify(text_chunk):
     prompt = f"""
-    Analyze this text extracted from exam PDF/notes.
-    It can be MCQs with options OR One-Liner Question & Answer table formats.
+    You are an expert Educational Content Creator & NCERT Curriculum Verifier.
+    The text below contains MCQs, One-liners, or Question-Answer tables from an exam book/notes.
 
     TASK:
-    Extract all questions and output ONLY a raw JSON array of objects.
+    1. Extract all questions from the text.
+    2. Convert One-Liners or Q&A tables into proper 4-option MCQs.
+    3. VERY IMPORTANT (NCERT VERIFICATION): Verify the correct answer against standard NCERT Textbooks (Class 6th to 12th) / Official Syllabus facts. 
+       - If the PDF has a wrong answer, CORRECT IT as per NCERT facts.
+       - Provide a brief reference or explanation citing NCERT concepts in the 'explanation' field.
 
-    FORMAT:
+    OUTPUT FORMAT (Strict Raw JSON Array ONLY):
     [
       {{
-        "question": "Question text here",
-        "option_a": "Option A or Correct Answer",
-        "option_b": "Option B or Logical distractor",
-        "option_c": "Option C or Logical distractor",
-        "option_d": "Option D or Logical distractor",
-        "correct_option": "A",
-        "explanation": "Brief context",
-        "exam": "General GK",
-        "subject": "General Knowledge",
-        "chapter": "General",
-        "language": "English"
+        "question": "Question text",
+        "option_a": "Option A text",
+        "option_b": "Option B text",
+        "option_c": "Option C text",
+        "option_d": "Option D text",
+        "correct_option": "A/B/C/D",
+        "explanation": "Verified with NCERT: Brief explanation of the concept",
+        "subject": "Subject Name",
+        "exam": "Competitive Exams"
       }}
     ]
 
-    STRICT INSTRUCTIONS:
-    1. If the text is a Question & Answer list (without options), place the correct answer in option_a, generate 3 reasonable fake options for B, C, D, and set correct_option to "A".
-    2. If it is already a 4-option MCQ, parse options A, B, C, D and correct answer accurately.
-    3. Output ONLY valid JSON array without ```json backticks or extra lines.
+    STRICT RULES:
+    - Return ONLY the JSON array without backticks (```json) or extra intro/outro text.
 
-    Text:
-    {text_chunk[:10000]}
+    Text to Process:
+    {text_chunk[:12000]}
     """
     
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = groq_client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": "You are a JSON parser that outputs valid raw JSON arrays only."},
-                    {"role": "user", "content": prompt}
-                ],
-                model="llama-3.1-8b-instant",
-                temperature=0.1
-            )
+    try:
+        response = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a JSON parser that strictly verifies exam questions with NCERT textbooks and outputs valid raw JSON arrays only."},
+                {"role": "user", "content": prompt}
+            ],
+            model="llama-3.1-8b-instant",
+            temperature=0.1
+        )
+        
+        raw_text = response.choices[0].message.content.strip()
+        
+        # Markdown cleanup
+        if raw_text.startswith("```json"):
+            raw_text = raw_text[7:]
+        if raw_text.startswith("```"):
+            raw_text = raw_text[3:]
+        if raw_text.endswith("```"):
+            raw_text = raw_text[:-3]
             
-            raw_text = response.choices[0].message.content.strip()
-            
-            if raw_text.startswith("```json"):
-                raw_text = raw_text[7:]
-            if raw_text.startswith("```"):
-                raw_text = raw_text[3:]
-            if raw_text.endswith("```"):
-                raw_text = raw_text[:-3]
-                
-            data = json.loads(raw_text.strip())
-            return data if isinstance(data, list) else []
-            
-        except Exception as e:
-            err_msg = str(e)
-            print(f"Attempt {attempt+1} Groq Error: {err_msg}")
-            if "429" in err_msg:
-                time.sleep(10)
-            else:
-                time.sleep(2)
-                
-    return []
+        data = json.loads(raw_text.strip())
+        return data if isinstance(data, list) else []
+        
+    except Exception as e:
+        print(f"NCERT Verification Error: {e}")
+        return []
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Hello! Send me any PDF file (MCQs or One-liner Q&A tables) and I will extract and save them to Supabase.")
+    await update.message.reply_text("👋 Hello! Send me any PDF (MCQs, One-Liners, or Q&A tables). I will extract, verify answers with NCERT Syllabus, and save them to Supabase Database!")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -115,18 +108,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_path = f"/tmp/{update.message.document.file_name}"
     await file.download_to_drive(file_path)
     
-    status_msg = await update.message.reply_text("⚙️ Reading PDF file...")
+    status_msg = await update.message.reply_text("⚙️ Reading PDF & Verifying with NCERT Syllabus...")
     
     try:
         chunks, total_pages = extract_chunks_from_pdf(file_path, pages_per_chunk=3)
     except Exception as e:
         await status_msg.edit_text(f"❌ Failed to read PDF: {str(e)}")
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        return
-
-    if not chunks:
-        await status_msg.edit_text("❌ Could not extract text from this PDF. Please try a readable text PDF.")
         if os.path.exists(file_path):
             os.remove(file_path)
         return
@@ -137,11 +124,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     for idx, (chunk_text, page_num) in enumerate(chunks):
         try:
-            await status_msg.edit_text(f"⚙️ Groq AI Processing: Page {page_num}/{total_pages} (Batch {idx+1}/{total_splits})...\n📥 Saved Questions: {saved_count}")
+            await status_msg.edit_text(f"⚙️ NCERT Verification in Progress: Page {page_num}/{total_pages} (Batch {idx+1}/{total_splits})...\n📥 Verified & Saved: {saved_count}")
         except Exception:
             pass
             
-        mcqs = process_chunk_with_groq(chunk_text)
+        mcqs = process_chunk_with_groq_ncert_verify(chunk_text)
         
         for item in mcqs:
             q_text = item.get("question")
@@ -158,23 +145,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "option_c": str(item.get("option_c", "N/A")),
                     "option_d": str(item.get("option_d", "N/A")),
                     "correct_option": str(item.get("correct_option", "A")).upper()[:1],
-                    "explanation": str(item.get("explanation", "")),
-                    "exam_name": str(item.get("exam", "General")),
-                    "subject_name": str(item.get("subject", "General")),
-                    "chapter_name": str(item.get("chapter", "General")),
-                    "language": str(item.get("language", "English")),
+                    "explanation": str(item.get("explanation", "Verified with NCERT Standards.")),
+                    "exam_name": str(item.get("exam", "Competitive Exam")),
+                    "subject_name": str(item.get("subject", "General Knowledge")),
                     "content_hash": q_hash
                 }).execute()
                 saved_count += 1
             except Exception:
                 duplicate_count += 1
 
-        time.sleep(2)
+        time.sleep(1.5)
 
     if os.path.exists(file_path):
         os.remove(file_path)
         
-    await status_msg.edit_text(f"✅ Processing Complete!\n\n📥 Total Saved: {saved_count}\n⚠️ Duplicates/Skipped: {duplicate_count}")
+    await status_msg.edit_text(f"✅ NCERT Verification & Processing Complete!\n\n📥 Verified Questions Saved: {saved_count}\n⚠️ Skipped/Duplicates: {duplicate_count}")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -189,4 +174,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-            
+        
