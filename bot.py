@@ -51,16 +51,15 @@ def process_pdf_chunk_with_gemini(chunk_pdf_path):
     
     uploaded_file = None
     try:
-        # Direct Gemini Native File Upload (OCR & Vision Capable)
         uploaded_file = ai_client.files.upload(file=chunk_pdf_path)
         
-        # Wait until file is processed by Gemini
         while uploaded_file.state.name == "PROCESSING":
             time.sleep(1)
             uploaded_file = ai_client.files.get(name=uploaded_file.name)
             
+        # Model string corrected for google-genai SDK
         response = ai_client.models.generate_content(
-            model='gemini-1.5-flash',
+            model='gemini-2.5-flash',
             contents=[uploaded_file, prompt]
         )
         
@@ -74,7 +73,6 @@ def process_pdf_chunk_with_gemini(chunk_pdf_path):
             
         data = json.loads(raw_text.strip())
         
-        # Cleanup file from Gemini servers
         ai_client.files.delete(name=uploaded_file.name)
         return data if isinstance(data, list) else []
     except Exception as e:
@@ -172,4 +170,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
