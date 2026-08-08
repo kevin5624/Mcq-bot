@@ -6,6 +6,7 @@ import requests
 import asyncio
 import html
 import pypdf
+import base64
 import cohere
 import anthropic
 from PIL import Image
@@ -73,7 +74,7 @@ def format_time(seconds):
     return f"{mins}m {secs}s"
 
 
-def extract_text_chunks_large_pdf(file_path, pages_per_chunk=8):
+def extract_text_chunks_large_pdf(file_path, pages_per_chunk=5):
     reader = pypdf.PdfReader(file_path)
     total_pages = len(reader.pages)
     chunks = []
@@ -82,7 +83,7 @@ def extract_text_chunks_large_pdf(file_path, pages_per_chunk=8):
         text = page.extract_text() or ""
         current_text += text + "\n"
         if (i + 1) % pages_per_chunk == 0 or (i + 1) == total_pages:
-            if len(current_text.strip()) > 30:
+            if len(current_text.strip()) > 20:
                 chunks.append((current_text, i + 1))
             current_text = ""
     return chunks, total_pages
@@ -141,8 +142,7 @@ def parse_json_response(raw_text):
     try:
         data = json.loads(clean_text)
         return data if isinstance(data, list) else []
-    except Exception as e:
-        # Fallback regex bracket extraction
+    except Exception:
         try:
             start = clean_text.find('[')
             end = clean_text.rfind(']')
@@ -179,38 +179,66 @@ def call_ai_fast(prompt_text):
 
 
 def process_vision_ai(file_path):
-    if not gemini_client:
-        return []
-    try:
-        img = Image.open(file_path)
-        prompt = """
-        Extract all MCQs, notes, or Q&A from this image/photo.
-        Verify facts against NCERT standards.
-        Output MUST strictly be a Raw JSON Array:
-        [
-          {
-            "question": "Question text",
-            "option_a": "Correct answer",
-            "option_b": "Wrong 1",
-            "option_c": "Wrong 2",
-            "option_d": "Wrong 3",
-            "correct_option": "A",
-            "explanation": "NCERT Verified concept note",
-            "difficulty": "Easy",
-            "exam": "General Exams",
-            "subject": "General Knowledge",
-            "chapter": "Misc"
-          }
-        ]
-        """
-        response = gemini_client.models.generate_content(
-            model='gemini-1.5-flash',
-            contents=[prompt, img]
-        )
-        return parse_json_response(response.text)
-    except Exception as e:
-        print(f"Vision AI OCR Error: {e}")
-        return []
+    # Vision AI OCR via Groq / Gemini Multi-Fallback
+    prompt = """
+    Extract ALL MCQs, questions, options, and answers visible in this image.
+    Verify facts against NCERT standards.
+    Output MUST strictly be a Raw JSON Array ONLY:
+    [
+      {
+        "question": "Question text",
+        "option_a": "Option A text",
+        "option_b": "Option B text",
+        "option_c": "Option C text",
+        "option_d": "Option D text",
+        "correct_option": "A",
+        "explanation": "NCERT Verified concept note",
+        "difficulty": "Easy",
+        "exam": "General Exams",
+        "subject": "General Knowledge",
+        "chapter": "Misc"
+      }
+    ]
+    Do not output markdown code blocks. Output raw JSON array only.
+    """
+    
+    # Provider 1: Gemini Vision
+    if gemini_client:
+        try:
+            img = Image.open(file_path)
+            res = gemini_client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=[prompt, img]
+            )
+            parsed = parse_json_response(res.text)
+            if parsed:
+                return parsed
+        except Exception as e:
+            print(f"Gemini Vision Error: {e}")
+
+    # Provider 2: OpenRouter Vision Fallback
+    if openrouter_client:
+        try:
+            with open(file_path, "rb") as image_file:
+                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+            
+            res = openrouter_client.chat.completions.create(
+                model="google/gemini-flash-1.5-8b:free",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                    ]
+                }]
+            )
+            parsed = parse_json_response(res.choices[0].message.content)
+            if parsed:
+                return parsed
+        except Exception as e:
+            print(f"OpenRouter Vision Error: {e}")
+
+    return []
 
 
 def insert_question_into_cluster(item):
@@ -239,7 +267,6 @@ def insert_question_into_cluster(item):
         "content_hash": q_hash
     }
 
-    # Robust Insert across Cluster
     for client in db_clients:
         try:
             res = client.table("questions").insert(data_payload).execute()
@@ -249,7 +276,6 @@ def insert_question_into_cluster(item):
             err_str = str(err).lower()
             if "duplicate" in err_str or "unique" in err_str or "23505" in err_str:
                 return False, "duplicate"
-            print(f"DB Insert Error: {err}")
             continue
 
     return False, "duplicate_or_failed"
@@ -257,8 +283,6 @@ def insert_question_into_cluster(item):
 
 def fetch_open_source_questions_ncert_verified(target_count=500):
     saved = 0
-    
-    # Direct Reliable Source Fetching
     try:
         url = "https://the-trivia-api.com/v2/questions?limit=50"
         for _ in range(10):
@@ -317,7 +341,7 @@ async def file_queue_worker():
             duplicate_count = 0
             
             if is_image:
-                await status_msg.edit_text(f"🖼️ **Running Vision AI OCR on Image:** `{file_name}`...")
+                await status_msg.edit_text(f"🖼️ **Extracting MCQs via Vision AI OCR:** `{file_name}`...")
                 mcqs = process_vision_ai(file_path)
                 for item in mcqs:
                     status, flag = insert_question_into_cluster(item)
@@ -327,7 +351,7 @@ async def file_queue_worker():
                         duplicate_count += 1
             else:
                 try:
-                    chunks, total_pages = extract_text_chunks_large_pdf(file_path, pages_per_chunk=8)
+                    chunks, total_pages = extract_text_chunks_large_pdf(file_path, pages_per_chunk=5)
                 except Exception as e:
                     await status_msg.edit_text(f"❌ Extraction error: {str(e)}")
                     if os.path.exists(file_path): 
@@ -419,7 +443,10 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document or update.message.photo[-1]
+    doc = update.message.document or (update.message.photo[-1] if update.message.photo else None)
+    if not doc:
+        return
+        
     file_id = doc.file_id
     file_name = getattr(doc, 'file_name', f"photo_{int(time.time())}.jpg")
     file_size = getattr(doc, 'file_size', 0)
@@ -453,4 +480,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
