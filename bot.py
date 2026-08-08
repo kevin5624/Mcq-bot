@@ -169,6 +169,46 @@ def insert_question_into_cluster(item):
     q_text_clean = str(q_text).strip()
     q_hash = hashlib.sha256(q_text_clean.lower().encode()).hexdigest()
     
+    # PEHLE SABHI DBs ME DUPLICATE CHECK KAREIN
+    for client in db_clients:
+        if is_semantic_duplicate(client, q_text_clean):
+            return False, "duplicate"
+
+    subject = str(item.get("subject", "General Knowledge")).strip()
+    language = "Hindi" if "hindi" in subject.lower() else "English"
+
+    data_payload = {
+        "question_text": q_text_clean,
+        "option_a": str(item.get("option_a", "N/A")),
+        "option_b": str(item.get("option_b", "N/A")),
+        "option_c": str(item.get("option_c", "N/A")),
+        "option_d": str(item.get("option_d", "N/A")),
+        "correct_option": str(item.get("correct_option", "A")).upper()[:1],
+        "explanation": str(item.get("explanation", "NCERT Verified Standard Fact.")),
+        "exam_name": str(item.get("exam", "Competitive Exams")),
+        "subject_name": subject,
+        "chapter_name": str(item.get("chapter", "General")),
+        "language": language,
+        "content_hash": q_hash
+    }
+
+    # UNIONS CHECK KE BAAD HI INSERT KAREIN
+    for client in db_clients:
+        try:
+            client.table("questions").insert(data_payload).execute()
+            return True, "saved"
+        except Exception:
+            continue
+
+    return False, "duplicate_or_failed"
+
+    q_text = item.get("question")
+    if not q_text or len(str(q_text).strip()) < 5:
+        return False, "invalid"
+
+    q_text_clean = str(q_text).strip()
+    q_hash = hashlib.sha256(q_text_clean.lower().encode()).hexdigest()
+    
     subject = str(item.get("subject", "General Knowledge")).strip()
     language = "Hindi" if "hindi" in subject.lower() else "English"
 
@@ -199,6 +239,70 @@ def insert_question_into_cluster(item):
 
 # Multi-Source Unlimited Fast Open-Source Scraper
 def fetch_open_source_questions_ncert_verified(target_count=500):
+    saved = 0
+    batch_size = 20  # AI NCERT Verification ke liye 20 ka batch
+    loops = target_count // batch_size
+    
+    for loop_idx in range(loops):
+        try:
+            url = f"https://opentdb.com/api.php?amount={batch_size}&type=multiple"
+            resp = requests.get(url, timeout=10).json()
+            
+            if resp.get("response_code") == 0:
+                raw_data = resp.get("results", [])
+                raw_questions = []
+                for item in raw_data:
+                    raw_questions.append({
+                        "question": html.unescape(item.get("question", "")),
+                        "given_answer": html.unescape(item.get("correct_answer", "")),
+                        "wrong_options": [html.unescape(x) for x in item.get("incorrect_answers", [])],
+                        "category": html.unescape(item.get("category", ""))
+                    })
+                
+                # PEHLE AI SE NCERT VERIFY KARWAYEIN
+                prompt = f"""
+                You are an NCERT Curriculum Verifier.
+                Verify these internet questions against NCERT/Academic facts.
+                
+                RULES:
+                1. Correct any wrong answers according to NCERT facts.
+                2. Ensure wrong options are contextually relevant to question topic.
+                3. Set correct_option="A" with NCERT answer in option_a.
+                4. Keep language English (unless subject is Hindi).
+
+                OUTPUT FORMAT (Strict Raw JSON Array ONLY):
+                [
+                  {{
+                    "question": "Question text",
+                    "option_a": "NCERT Verified Correct Answer",
+                    "option_b": "Wrong 1",
+                    "option_c": "Wrong 2",
+                    "option_d": "Wrong 3",
+                    "correct_option": "A",
+                    "explanation": "NCERT Verification Note",
+                    "exam": "General Exams",
+                    "subject": "General Knowledge",
+                    "chapter": "Misc"
+                  }}
+                ]
+
+                Raw Data to verify: {json.dumps(raw_questions)}
+                """
+                
+                # VERIFIED DATA KO HI LEIN
+                verified_mcqs = call_ai_fast(prompt)
+                
+                for item in verified_mcqs:
+                    status, _ = insert_question_into_cluster(item)
+                    if status:
+                        saved += 1
+                        
+            time.sleep(1.5)
+        except Exception as e:
+            print(f"Verified Scraper Batch {loop_idx+1} Error: {e}")
+            
+    return saved
+
     saved = 0
     
     # Source 1: OpenTDB Multi-Category Fetch Loop
