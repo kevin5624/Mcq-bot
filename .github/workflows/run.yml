@@ -3,7 +3,7 @@ name: Telegram MCQ Cluster Engine
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 0 * * *' # Every night at 12 AM UTC
 
 jobs:
   run-cluster-bot:
@@ -23,7 +23,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Run Telegram Bot Cluster
+    - name: Run Engine Process
       env:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
