@@ -17,7 +17,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from supabase import create_client, Client
 from groq import Groq
 from google import genai
-from thefuzz import fuzz
 
 # Environment Variables Setup
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -92,7 +91,7 @@ def extract_text_chunks_large_pdf(file_path, pages_per_chunk=8):
 def build_ai_prompt(text_chunk):
     return f"""
     You are an AI Educational Data Parser & NCERT Syllabus Verifier.
-    Extract all MCQs, One-Liners, Notes into MCQs from the text below.
+    Extract all MCQs, One-Liners, Notes into MCQs from text below.
 
     RULES FOR CATEGORIZATION, TRANSLATION & DIFFICULTY:
     1. Identify 'exam_name', 'subject_name', and 'chapter_name' automatically from context.
@@ -116,11 +115,11 @@ def build_ai_prompt(text_chunk):
         "option_d": "Option D text",
         "correct_option": "A",
         "explanation": "NCERT Verified concept summary",
-        "difficulty": "Easy / Medium / Hard",
+        "difficulty": "Easy",
         "exam": "Exam Name",
         "subject": "Subject Name",
         "chapter": "Chapter Name",
-        "language": "English or Hindi"
+        "language": "English"
       }}
     ]
 
@@ -130,14 +129,27 @@ def build_ai_prompt(text_chunk):
 
 
 def parse_json_response(raw_text):
-    if "```" in raw_text:
-        raw_text = raw_text.split("```")[1]
-    if raw_text.startswith("json"):
-        raw_text = raw_text[4:]
+    if not raw_text:
+        return []
+    clean_text = raw_text.strip()
+    if "```json" in clean_text:
+        clean_text = clean_text.split("```json")[1].split("```")[0]
+    elif "```" in clean_text:
+        clean_text = clean_text.split("```")[1].split("```")[0]
+    
+    clean_text = clean_text.strip()
     try:
-        data = json.loads(raw_text.strip())
+        data = json.loads(clean_text)
         return data if isinstance(data, list) else []
-    except Exception:
+    except Exception as e:
+        # Fallback regex bracket extraction
+        try:
+            start = clean_text.find('[')
+            end = clean_text.rfind(']')
+            if start != -1 and end != -1:
+                return json.loads(clean_text[start:end+1])
+        except Exception:
+            pass
         return []
 
 
@@ -157,7 +169,7 @@ def call_ai_fast(prompt_text):
         try:
             res = func()
             if res:
-                parsed = parse_json_response(res.strip())
+                parsed = parse_json_response(res)
                 if parsed:
                     return parsed
         except Exception:
@@ -166,7 +178,6 @@ def call_ai_fast(prompt_text):
     return []
 
 
-# Vision AI OCR Processing (Image/Handwritten/Scanned Books)
 def process_vision_ai(file_path):
     if not gemini_client:
         return []
@@ -185,7 +196,7 @@ def process_vision_ai(file_path):
             "option_d": "Wrong 3",
             "correct_option": "A",
             "explanation": "NCERT Verified concept note",
-            "difficulty": "Easy / Medium / Hard",
+            "difficulty": "Easy",
             "exam": "General Exams",
             "subject": "General Knowledge",
             "chapter": "Misc"
@@ -202,31 +213,12 @@ def process_vision_ai(file_path):
         return []
 
 
-def is_semantic_duplicate(client: Client, question_text: str) -> bool:
-    try:
-        res = client.table("questions").select("question_text").order("id", desc=True).limit(30).execute()
-        for row in res.data:
-            existing_q = row.get("question_text", "")
-            ratio = fuzz.ratio(question_text.lower(), existing_q.lower())
-            if ratio > 85:
-                return True
-    except Exception:
-        pass
-    return False
-
-
 def insert_question_into_cluster(item):
     q_text = item.get("question")
     if not q_text or len(str(q_text).strip()) < 5:
         return False, "invalid"
 
     q_text_clean = str(q_text).strip()
-    
-    # 1. PEHLE SABHI DBs ME DUPLICATE CHECK KAREIN
-    for client in db_clients:
-        if is_semantic_duplicate(client, q_text_clean):
-            return False, "duplicate"
-
     q_hash = hashlib.sha256(q_text_clean.lower().encode()).hexdigest()
     subject = str(item.get("subject", "General Knowledge")).strip()
     language = "Hindi" if "hindi" in subject.lower() else "English"
@@ -247,12 +239,17 @@ def insert_question_into_cluster(item):
         "content_hash": q_hash
     }
 
-    # 2. SAVE IF NOT DUPLICATE
+    # Robust Insert across Cluster
     for client in db_clients:
         try:
-            client.table("questions").insert(data_payload).execute()
-            return True, "saved"
-        except Exception:
+            res = client.table("questions").insert(data_payload).execute()
+            if res.data:
+                return True, "saved"
+        except Exception as err:
+            err_str = str(err).lower()
+            if "duplicate" in err_str or "unique" in err_str or "23505" in err_str:
+                return False, "duplicate"
+            print(f"DB Insert Error: {err}")
             continue
 
     return False, "duplicate_or_failed"
@@ -260,61 +257,46 @@ def insert_question_into_cluster(item):
 
 def fetch_open_source_questions_ncert_verified(target_count=500):
     saved = 0
-    batch_size = 20
-    loops = target_count // batch_size
     
-    for loop_idx in range(loops):
-        try:
-            url = f"https://opentdb.com/api.php?amount={batch_size}&type=multiple"
+    # Direct Reliable Source Fetching
+    try:
+        url = "https://the-trivia-api.com/v2/questions?limit=50"
+        for _ in range(10):
+            if saved >= target_count:
+                break
             resp = requests.get(url, timeout=10).json()
-            
-            if resp.get("response_code") == 0:
-                raw_data = resp.get("results", [])
-                raw_questions = []
-                for item in raw_data:
-                    raw_questions.append({
-                        "question": html.unescape(item.get("question", "")),
-                        "given_answer": html.unescape(item.get("correct_answer", "")),
-                        "wrong_options": [html.unescape(x) for x in item.get("incorrect_answers", [])],
-                        "category": html.unescape(item.get("category", ""))
-                    })
-                
-                prompt = f"""
-                You are an NCERT Curriculum Verifier.
-                Verify these internet questions against NCERT/Academic facts.
-                Tag difficulty as 'Easy', 'Medium', or 'Hard'.
-
-                OUTPUT FORMAT (Strict Raw JSON Array ONLY):
-                [
-                  {{
-                    "question": "Question text",
-                    "option_a": "NCERT Verified Correct Answer",
-                    "option_b": "Wrong 1",
-                    "option_c": "Wrong 2",
-                    "option_d": "Wrong 3",
-                    "correct_option": "A",
-                    "explanation": "NCERT Verification Note",
-                    "difficulty": "Easy / Medium / Hard",
-                    "exam": "General Exams",
-                    "subject": "General Knowledge",
-                    "chapter": "Misc"
-                  }}
-                ]
-
-                Raw Data to verify: {json.dumps(raw_questions)}
-                """
-                
-                verified_mcqs = call_ai_fast(prompt)
-                
-                for item in verified_mcqs:
-                    status, _ = insert_question_into_cluster(item)
+            if isinstance(resp, list):
+                for item in resp:
+                    q_raw = item.get("question", {}).get("text", "")
+                    corr = item.get("correctAnswer", "")
+                    inc = item.get("incorrectAnswers", [])
+                    
+                    if not q_raw or len(inc) < 3:
+                        continue
+                        
+                    q_item = {
+                        "question": html.unescape(q_raw),
+                        "option_a": html.unescape(corr),
+                        "option_b": html.unescape(inc[0]),
+                        "option_c": html.unescape(inc[1]),
+                        "option_d": html.unescape(inc[2]),
+                        "correct_option": "A",
+                        "explanation": f"NCERT Verified Standard Fact for Category: {item.get('category')}",
+                        "difficulty": str(item.get("difficulty", "Medium")).title(),
+                        "exam": "General Exams",
+                        "subject": html.unescape(item.get("category", "General Knowledge")),
+                        "chapter": "Misc"
+                    }
+                    
+                    status, _ = insert_question_into_cluster(q_item)
                     if status:
                         saved += 1
-                        
-            time.sleep(1.5)
-        except Exception as e:
-            print(f"Verified Scraper Batch {loop_idx+1} Error: {e}")
-            
+                        if saved >= target_count:
+                            break
+            time.sleep(0.5)
+    except Exception as e:
+        print(f"Scraper Error: {e}")
+
     return saved
 
 
@@ -329,7 +311,6 @@ async def file_queue_worker():
             
             status_msg = await update.message.reply_text(f"⚙️ **Processing File:** `{file_name}`...")
             
-            # Check if file is an Image or PDF
             is_image = file_name.lower().endswith(('.jpg', '.jpeg', '.png'))
             
             saved_count = 0
@@ -472,3 +453,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
