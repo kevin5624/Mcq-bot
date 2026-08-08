@@ -6,6 +6,11 @@ import requests
 import asyncio
 import html
 import pypdf
+import cohere
+import anthropic
+from together import Together
+from huggingface_hub import InferenceClient
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from supabase import create_client, Client
@@ -15,24 +20,50 @@ from thefuzz import fuzz
 
 # Environment Variables Setup
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+
+# Multi-AI API Keys
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_KEY = os.environ.get("GEMINI_KEY")
+COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
+TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY")
+HUGGINGFACE_TOKEN = os.environ.get("HUGGINGFACE_TOKEN")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY")
+SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY")
+CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY")
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
+FIREWORKS_API_KEY = os.environ.get("FIREWORKS_API_KEY")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 
+# Supabase Cluster Keys
 SUPABASE_URL_1 = os.environ.get("SUPABASE_URL_1")
 SUPABASE_KEY_1 = os.environ.get("SUPABASE_KEY_1")
 SUPABASE_URL_2 = os.environ.get("SUPABASE_URL_2")
 SUPABASE_KEY_2 = os.environ.get("SUPABASE_KEY_2")
 
-# Database Cluster Setup
+# Database Clients Cluster
 db_clients = []
 if SUPABASE_URL_1 and SUPABASE_KEY_1:
     db_clients.append(create_client(SUPABASE_URL_1, SUPABASE_KEY_1))
 if SUPABASE_URL_2 and SUPABASE_KEY_2:
     db_clients.append(create_client(SUPABASE_URL_2, SUPABASE_KEY_2))
 
-# AI Clients
+# Multi-AI Clients Initialization
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 gemini_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
+cohere_client = cohere.Client(api_key=COHERE_API_KEY) if COHERE_API_KEY else None
+together_client = Together(api_key=TOGETHER_API_KEY) if TOGETHER_API_KEY else None
+hf_client = InferenceClient(api_key=HUGGINGFACE_TOKEN) if HUGGINGFACE_TOKEN else None
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+
+openrouter_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY) if OPENROUTER_API_KEY else None
+deepinfra_client = OpenAI(base_url="https://api.deepinfra.com/v1/openai", api_key=DEEPINFRA_API_KEY) if DEEPINFRA_API_KEY else None
+sambanova_client = OpenAI(base_url="https://api.sambanova.ai/v1", api_key=SAMBANOVA_API_KEY) if SAMBANOVA_API_KEY else None
+cerebras_client = OpenAI(base_url="https://api.cerebras.ai/v1", api_key=CEREBRAS_API_KEY) if CEREBRAS_API_KEY else None
+mistral_client = OpenAI(base_url="https://api.mistral.ai/v1", api_key=MISTRAL_API_KEY) if MISTRAL_API_KEY else None
+fireworks_client = OpenAI(base_url="https://api.fireworks.ai/inference/v1", api_key=FIREWORKS_API_KEY) if FIREWORKS_API_KEY else None
+deepseek_client = OpenAI(base_url="https://api.deepseek.com", api_key=DEEPSEEK_API_KEY) if DEEPSEEK_API_KEY else None
 
 file_queue = asyncio.Queue()
 
@@ -41,7 +72,6 @@ def extract_text_chunks_large_pdf(file_path, pages_per_chunk=3):
     reader = pypdf.PdfReader(file_path)
     total_pages = len(reader.pages)
     chunks = []
-    
     current_text = ""
     for i, page in enumerate(reader.pages):
         text = page.extract_text() or ""
@@ -50,7 +80,6 @@ def extract_text_chunks_large_pdf(file_path, pages_per_chunk=3):
             if len(current_text.strip()) > 30:
                 chunks.append((current_text, i + 1))
             current_text = ""
-            
     return chunks, total_pages
 
 
@@ -87,7 +116,7 @@ def build_ai_prompt(text_chunk):
       }}
     ]
 
-    Do NOT include markdown like ```json. Output raw JSON array only.
+    Do NOT include markdown formatting like ```json. Output raw JSON array only.
 
     Text Chunk:
     {text_chunk[:10000]}
@@ -108,41 +137,36 @@ def parse_json_response(raw_text):
         return []
 
 
-def call_ai_with_fallback(prompt_text):
+def call_ai_with_super_cluster_fallback(prompt_text):
     prompt = prompt_text if "OUTPUT FORMAT" in prompt_text else build_ai_prompt(prompt_text)
     
-    # Try Groq AI First
-    if groq_client:
+    # Provider List Strategy
+    providers = [
+        ("Groq", lambda: groq_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama-3.1-8b-instant").choices[0].message.content),
+        ("SambaNova", lambda: sambanova_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="Meta-Llama-3.1-8B-Instruct").choices[0].message.content),
+        ("Cerebras", lambda: cerebras_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama3.1-8b").choices[0].message.content),
+        ("Gemini", lambda: gemini_client.models.generate_content(model='gemini-1.5-flash', contents=prompt).text),
+        ("Cohere", lambda: cohere_client.chat(message=prompt, model="command-r-plus").text),
+        ("DeepSeek", lambda: deepseek_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="deepseek-chat").choices[0].message.content),
+        ("Claude", lambda: anthropic_client.messages.create(model="claude-3-5-haiku-latest", max_tokens=2000, messages=[{"role": "user", "content": prompt}]).content[0].text),
+        ("Together", lambda: together_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo").choices[0].message.content),
+        ("OpenRouter", lambda: openrouter_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/llama-3.3-70b-instruct:free").choices[0].message.content),
+        ("DeepInfra", lambda: deepinfra_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/Meta-Llama-3.1-8B-Instruct").choices[0].message.content),
+        ("Fireworks", lambda: fireworks_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="accounts/fireworks/models/llama-v3p1-8b-instruct").choices[0].message.content),
+        ("Mistral", lambda: mistral_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="open-mistral-7b").choices[0].message.content),
+        ("HuggingFace", lambda: hf_client.text_generation(prompt, model="meta-llama/Llama-3.2-3B-Instruct"))
+    ]
+
+    for name, client_func in providers:
         try:
-            res = groq_client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": "You output valid raw JSON arrays only."},
-                    {"role": "user", "content": prompt}
-                ],
-                model="llama-3.1-8b-instant",
-                temperature=0.1
-            )
-            raw = res.choices[0].message.content.strip()
-            parsed = parse_json_response(raw)
+            raw_res = client_func()
+            parsed = parse_json_response(raw_res.strip())
             if parsed:
                 return parsed
-        except Exception as e:
-            print(f"Groq Limit/Error: {e}. Switching to Gemini AI Fallback...")
+        except Exception:
+            continue
 
-    # Fallback to Gemini AI
-    if gemini_client:
-        try:
-            res = gemini_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt
-            )
-            raw = res.text.strip()
-            parsed = parse_json_response(raw)
-            if parsed:
-                return parsed
-        except Exception as e:
-            print(f"Gemini Fallback Error: {e}")
-
+    time.sleep(2)
     return []
 
 
@@ -199,10 +223,10 @@ def insert_question_into_cluster(item):
     return False, "duplicate_or_failed"
 
 
-# Token-Optimized NCERT Verified Bulk Open-Source Scraper
+# NCERT Verified Bulk Open-Source Scraper
 def fetch_open_source_questions_ncert_verified(target_count=500):
     saved = 0
-    batch_size = 20  # Optimized 20-item batches to prevent token limits
+    batch_size = 20
     loops = target_count // batch_size
     
     for loop_idx in range(loops):
@@ -220,7 +244,6 @@ def fetch_open_source_questions_ncert_verified(target_count=500):
                         "category": html.unescape(item.get("category", ""))
                     })
                 
-                # Compact AI Prompt for NCERT Verification
                 prompt = f"""
                 You are an NCERT Curriculum Verifier.
                 Verify these internet questions against NCERT/Academic facts.
@@ -251,13 +274,13 @@ def fetch_open_source_questions_ncert_verified(target_count=500):
                 {json.dumps(raw_questions)}
                 """
                 
-                verified_mcqs = call_ai_with_fallback(prompt)
+                verified_mcqs = call_ai_with_super_cluster_fallback(prompt)
                 for item in verified_mcqs:
                     status, _ = insert_question_into_cluster(item)
                     if status:
                         saved += 1
                         
-            time.sleep(2)  # Short pause
+            time.sleep(2)
             
         except Exception as e:
             print(f"Verified Scraper Batch {loop_idx+1} Error: {e}")
@@ -299,7 +322,7 @@ async def file_queue_worker():
                 except Exception:
                     pass
 
-                mcqs = call_ai_with_fallback(chunk_text)
+                mcqs = call_ai_with_super_cluster_fallback(chunk_text)
                 
                 for item in mcqs:
                     status, flag = insert_question_into_cluster(item)
@@ -329,7 +352,7 @@ async def file_queue_worker():
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 **NCERT-Verified MCQ Cluster Bot Active!**\n\n"
+        "👋 **Super Multi-AI Cluster Powered MCQ Bot Active!**\n\n"
         "📁 Upload multiple PDFs (up to 100MB each) - Queue will process sequentially.\n"
         "📊 Type `/stats` to see detailed category & DB analytics.\n"
         "🌐 Type `/scrape` to auto-fetch 500+ NCERT-verified open-source questions."
@@ -390,9 +413,8 @@ def main():
     loop = asyncio.get_event_loop()
     loop.create_task(file_queue_worker())
     
-    print("Bot Cluster Running...")
+    print("Super Multi-AI Cluster Powered Bot Running...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-    
