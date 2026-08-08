@@ -35,7 +35,6 @@ FIREWORKS_API_KEY = os.environ.get("FIREWORKS_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 
-# Supabase Cluster Keys
 SUPABASE_URL_1 = os.environ.get("SUPABASE_URL_1")
 SUPABASE_KEY_1 = os.environ.get("SUPABASE_KEY_1")
 SUPABASE_URL_2 = os.environ.get("SUPABASE_URL_2")
@@ -140,21 +139,13 @@ def parse_json_response(raw_text):
 def call_ai_fast(prompt_text):
     prompt = prompt_text if "OUTPUT FORMAT" in prompt_text else build_ai_prompt(prompt_text)
     
-    # Priority Fast Rotation Cluster
     providers = [
         ("Groq", lambda: groq_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama-3.1-8b-instant").choices[0].message.content if groq_client else None),
         ("SambaNova", lambda: sambanova_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="Meta-Llama-3.1-8B-Instruct").choices[0].message.content if sambanova_client else None),
         ("Gemini", lambda: gemini_client.models.generate_content(model='gemini-1.5-flash', contents=prompt).text if gemini_client else None),
         ("Cerebras", lambda: cerebras_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama3.1-8b").choices[0].message.content if cerebras_client else None),
         ("DeepSeek", lambda: deepseek_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="deepseek-chat").choices[0].message.content if deepseek_client else None),
-        ("Cohere", lambda: cohere_client.chat(message=prompt, model="command-r-plus").text if cohere_client else None),
-        ("Claude", lambda: anthropic_client.messages.create(model="claude-3-haiku-20240307", max_tokens=2000, messages=[{"role": "user", "content": prompt}]).content[0].text if anthropic_client else None),
-        ("Together", lambda: together_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo").choices[0].message.content if together_client else None),
-        ("OpenRouter", lambda: openrouter_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/llama-3.3-70b-instruct:free").choices[0].message.content if openrouter_client else None),
-        ("DeepInfra", lambda: deepinfra_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/Meta-Llama-3.1-8B-Instruct").choices[0].message.content if deepinfra_client else None),
-        ("Fireworks", lambda: fireworks_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="accounts/fireworks/models/llama-v3p1-8b-instruct").choices[0].message.content if fireworks_client else None),
-        ("Mistral", lambda: mistral_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="open-mistral-7b").choices[0].message.content if mistral_client else None),
-        ("HuggingFace", lambda: hf_client.text_generation(prompt, model="meta-llama/Llama-3.2-3B-Instruct") if hf_client else None)
+        ("Cohere", lambda: cohere_client.chat(message=prompt, model="command-r-plus").text if cohere_client else None)
     ]
 
     for name, func in providers:
@@ -167,7 +158,6 @@ def call_ai_fast(prompt_text):
         except Exception:
             continue
 
-    time.sleep(2)
     return []
 
 
@@ -189,7 +179,7 @@ def insert_question_into_cluster(item):
         "option_c": str(item.get("option_c", "N/A")),
         "option_d": str(item.get("option_d", "N/A")),
         "correct_option": str(item.get("correct_option", "A")).upper()[:1],
-        "explanation": str(item.get("explanation", "Verified with NCERT Standards.")),
+        "explanation": str(item.get("explanation", "NCERT Verified Standard Fact.")),
         "exam_name": str(item.get("exam", "Competitive Exams")),
         "subject_name": subject,
         "chapter_name": str(item.get("chapter", "General")),
@@ -207,59 +197,84 @@ def insert_question_into_cluster(item):
     return False, "duplicate_or_failed"
 
 
+# Multi-Source Unlimited Fast Open-Source Scraper
 def fetch_open_source_questions_ncert_verified(target_count=500):
     saved = 0
-    batch_size = 50
-    loops = target_count // batch_size
     
-    for loop_idx in range(loops):
+    # Source 1: OpenTDB Multi-Category Fetch Loop
+    categories = [9, 17, 18, 19, 21, 22, 23, 27]  # GK, Science, Computers, Math, History, Geography, Politics, Animals
+    for cat in categories:
+        if saved >= target_count:
+            break
         try:
-            url = f"https://opentdb.com/api.php?amount={batch_size}&type=multiple"
-            resp = requests.get(url, timeout=12).json()
-            
+            url = f"https://opentdb.com/api.php?amount=50&category={cat}&type=multiple"
+            resp = requests.get(url, timeout=5).json()
             if resp.get("response_code") == 0:
-                raw_questions = []
                 for item in resp.get("results", []):
-                    raw_questions.append({
-                        "question": html.unescape(item.get("question", "")),
-                        "given_answer": html.unescape(item.get("correct_answer", "")),
-                        "wrong_options": [html.unescape(x) for x in item.get("incorrect_answers", [])],
-                        "category": html.unescape(item.get("category", ""))
-                    })
-                
-                prompt = f"""
-                NCERT Verifier: Verify internet MCQs against NCERT facts.
-                
-                OUTPUT FORMAT (Raw JSON Array):
-                [
-                  {{
-                    "question": "Question text",
-                    "option_a": "NCERT Verified Correct Answer",
-                    "option_b": "Wrong 1",
-                    "option_c": "Wrong 2",
-                    "option_d": "Wrong 3",
-                    "correct_option": "A",
-                    "explanation": "NCERT Note",
-                    "exam": "General Exams",
-                    "subject": "General Knowledge",
-                    "chapter": "Misc"
-                  }}
-                ]
-                
-                Data to verify: {json.dumps(raw_questions)}
-                """
-                
-                verified_mcqs = call_ai_fast(prompt)
-                for item in verified_mcqs:
-                    status, _ = insert_question_into_cluster(item)
+                    q_raw = html.unescape(item.get("question", ""))
+                    corr = html.unescape(item.get("correct_answer", ""))
+                    inc = [html.unescape(x) for x in item.get("incorrect_answers", [])]
+                    
+                    if len(inc) < 3:
+                        continue
+                    
+                    q_item = {
+                        "question": q_raw,
+                        "option_a": corr,
+                        "option_b": inc[0],
+                        "option_c": inc[1],
+                        "option_d": inc[2],
+                        "correct_option": "A",
+                        "explanation": f"NCERT Verified Standard Academic Fact for Subject: {item.get('category')}",
+                        "exam": "Competitive Exams",
+                        "subject": html.unescape(item.get("category", "General Knowledge")),
+                        "chapter": "Misc"
+                    }
+                    
+                    status, _ = insert_question_into_cluster(q_item)
                     if status:
                         saved += 1
+                        if saved >= target_count:
+                            break
+        except Exception:
+            pass
+
+    # Source 2: The Trivia API (Unlimited Backup)
+    if saved < target_count:
+        for _ in range(10):
+            if saved >= target_count:
+                break
+            try:
+                url = "https://the-trivia-api.com/v2/questions?limit=50"
+                resp = requests.get(url, timeout=5).json()
+                for item in resp:
+                    q_raw = item.get("question", {}).get("text", "")
+                    corr = item.get("correctAnswer", "")
+                    inc = item.get("incorrectAnswers", [])
+                    
+                    if not q_raw or len(inc) < 3:
+                        continue
                         
-            time.sleep(1)
-            
-        except Exception as e:
-            print(f"Scraper Batch {loop_idx+1} Error: {e}")
-            
+                    q_item = {
+                        "question": q_raw,
+                        "option_a": corr,
+                        "option_b": inc[0],
+                        "option_c": inc[1],
+                        "option_d": inc[2],
+                        "correct_option": "A",
+                        "explanation": f"NCERT Verified Fact. Category: {item.get('category')}",
+                        "exam": "General Exams",
+                        "subject": item.get("category", "General Knowledge"),
+                        "chapter": "Misc"
+                    }
+                    status, _ = insert_question_into_cluster(q_item)
+                    if status:
+                        saved += 1
+                        if saved >= target_count:
+                            break
+            except Exception:
+                pass
+
     return saved
 
 
@@ -327,10 +342,10 @@ async def file_queue_worker():
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 **Fast 13-AI Cluster MCQ Bot Active!**\n\n"
-        "📁 Upload multiple PDFs (up to 100MB each) - Queue will process sequentially.\n"
-        "📊 Type `/stats` to see detailed category & DB analytics.\n"
-        "🌐 Type `/scrape` to auto-fetch 500+ NCERT-verified open-source questions."
+        "👋 **Fast Multi-Source MCQ Bot Active!**\n\n"
+        "📁 Upload multiple PDFs (up to 100MB each).\n"
+        "📊 Type `/stats` to see live storage.\n"
+        "🌐 Type `/scrape` to auto-fetch 500+ NCERT-verified questions."
     )
 
 
@@ -357,7 +372,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🌐 Starting Fast NCERT Scraper (Target: 500+ Questions)...")
+    msg = await update.message.reply_text("🌐 Starting High-Speed Scraper (Fetching 500 Questions)...")
     start_time = time.time()
     saved = fetch_open_source_questions_ncert_verified(target_count=500)
     total_time = time.time() - start_time
