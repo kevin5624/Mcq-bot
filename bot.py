@@ -148,7 +148,8 @@ def call_ai_with_super_cluster_fallback(prompt_text):
         ("Gemini", lambda: gemini_client.models.generate_content(model='gemini-1.5-flash', contents=prompt).text),
         ("Cohere", lambda: cohere_client.chat(message=prompt, model="command-r-plus").text),
         ("DeepSeek", lambda: deepseek_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="deepseek-chat").choices[0].message.content),
-        ("Claude", lambda: anthropic_client.messages.create(model="claude-3-5-haiku-latest", max_tokens=2000, messages=[{"role": "user", "content": prompt}]).content[0].text),
+        ("Claude", lambda: anthropic_client.messages.create(model="claude-3-haiku-20240307", max_tokens=2000, messages=[{"role": "user", "content": prompt}]).content[0].text)
+
         ("Together", lambda: together_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo").choices[0].message.content),
         ("OpenRouter", lambda: openrouter_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/llama-3.3-70b-instruct:free").choices[0].message.content),
         ("DeepInfra", lambda: deepinfra_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/Meta-Llama-3.1-8B-Instruct").choices[0].message.content),
