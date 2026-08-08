@@ -8,6 +8,7 @@ import html
 import pypdf
 import cohere
 import anthropic
+from PIL import Image
 from together import Together
 from huggingface_hub import InferenceClient
 from openai import OpenAI
@@ -16,6 +17,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from supabase import create_client, Client
 from groq import Groq
 from google import genai
+from thefuzz import fuzz
 
 # Environment Variables Setup
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -35,6 +37,7 @@ FIREWORKS_API_KEY = os.environ.get("FIREWORKS_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 
+# Supabase Cluster Keys
 SUPABASE_URL_1 = os.environ.get("SUPABASE_URL_1")
 SUPABASE_KEY_1 = os.environ.get("SUPABASE_KEY_1")
 SUPABASE_URL_2 = os.environ.get("SUPABASE_URL_2")
@@ -89,9 +92,9 @@ def extract_text_chunks_large_pdf(file_path, pages_per_chunk=8):
 def build_ai_prompt(text_chunk):
     return f"""
     You are an AI Educational Data Parser & NCERT Syllabus Verifier.
-    Extract MCQs, One-Liners, Notes from text below.
+    Extract all MCQs, One-Liners, Notes into MCQs from the text below.
 
-    RULES FOR CATEGORIZATION & TRANSLATION:
+    RULES FOR CATEGORIZATION, TRANSLATION & DIFFICULTY:
     1. Identify 'exam_name', 'subject_name', and 'chapter_name' automatically from context.
     2. LANGUAGE RULE:
        - If 'subject_name' is Hindi / Hindi Literature, keep question & options in HINDI.
@@ -99,8 +102,9 @@ def build_ai_prompt(text_chunk):
     3. ONE-LINERS / NOTES TO MCQ CONVERSION:
        - Place correct answer in 'option_a' (correct_option="A").
        - Generate 3 WRONG OPTIONS (option_b, option_c, option_d) strictly CONTEXTUALLY RELATED to the topic.
-    4. NCERT VERIFICATION:
-       - Cross-check answers with NCERT Syllabus (Class 6th-12th). Correct any mistakes and state reason in 'explanation'.
+    4. NCERT VERIFICATION & DIFFICULTY:
+       - Cross-check answers with NCERT Syllabus (Class 6th-12th). Correct mistakes and state reason in 'explanation'.
+       - Tag difficulty as 'Easy', 'Medium', or 'Hard' based on complexity.
 
     OUTPUT FORMAT (Raw JSON Array Only):
     [
@@ -112,6 +116,7 @@ def build_ai_prompt(text_chunk):
         "option_d": "Option D text",
         "correct_option": "A",
         "explanation": "NCERT Verified concept summary",
+        "difficulty": "Easy / Medium / Hard",
         "exam": "Exam Name",
         "subject": "Subject Name",
         "chapter": "Chapter Name",
@@ -161,54 +166,68 @@ def call_ai_fast(prompt_text):
     return []
 
 
+# Vision AI OCR Processing (Image/Handwritten/Scanned Books)
+def process_vision_ai(file_path):
+    if not gemini_client:
+        return []
+    try:
+        img = Image.open(file_path)
+        prompt = """
+        Extract all MCQs, notes, or Q&A from this image/photo.
+        Verify facts against NCERT standards.
+        Output MUST strictly be a Raw JSON Array:
+        [
+          {
+            "question": "Question text",
+            "option_a": "Correct answer",
+            "option_b": "Wrong 1",
+            "option_c": "Wrong 2",
+            "option_d": "Wrong 3",
+            "correct_option": "A",
+            "explanation": "NCERT Verified concept note",
+            "difficulty": "Easy / Medium / Hard",
+            "exam": "General Exams",
+            "subject": "General Knowledge",
+            "chapter": "Misc"
+          }
+        ]
+        """
+        response = gemini_client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=[prompt, img]
+        )
+        return parse_json_response(response.text)
+    except Exception as e:
+        print(f"Vision AI OCR Error: {e}")
+        return []
+
+
+def is_semantic_duplicate(client: Client, question_text: str) -> bool:
+    try:
+        res = client.table("questions").select("question_text").order("id", desc=True).limit(30).execute()
+        for row in res.data:
+            existing_q = row.get("question_text", "")
+            ratio = fuzz.ratio(question_text.lower(), existing_q.lower())
+            if ratio > 85:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def insert_question_into_cluster(item):
     q_text = item.get("question")
     if not q_text or len(str(q_text).strip()) < 5:
         return False, "invalid"
 
     q_text_clean = str(q_text).strip()
-    q_hash = hashlib.sha256(q_text_clean.lower().encode()).hexdigest()
     
-    # PEHLE SABHI DBs ME DUPLICATE CHECK KAREIN
+    # 1. PEHLE SABHI DBs ME DUPLICATE CHECK KAREIN
     for client in db_clients:
         if is_semantic_duplicate(client, q_text_clean):
             return False, "duplicate"
 
-    subject = str(item.get("subject", "General Knowledge")).strip()
-    language = "Hindi" if "hindi" in subject.lower() else "English"
-
-    data_payload = {
-        "question_text": q_text_clean,
-        "option_a": str(item.get("option_a", "N/A")),
-        "option_b": str(item.get("option_b", "N/A")),
-        "option_c": str(item.get("option_c", "N/A")),
-        "option_d": str(item.get("option_d", "N/A")),
-        "correct_option": str(item.get("correct_option", "A")).upper()[:1],
-        "explanation": str(item.get("explanation", "NCERT Verified Standard Fact.")),
-        "exam_name": str(item.get("exam", "Competitive Exams")),
-        "subject_name": subject,
-        "chapter_name": str(item.get("chapter", "General")),
-        "language": language,
-        "content_hash": q_hash
-    }
-
-    # UNIONS CHECK KE BAAD HI INSERT KAREIN
-    for client in db_clients:
-        try:
-            client.table("questions").insert(data_payload).execute()
-            return True, "saved"
-        except Exception:
-            continue
-
-    return False, "duplicate_or_failed"
-
-    q_text = item.get("question")
-    if not q_text or len(str(q_text).strip()) < 5:
-        return False, "invalid"
-
-    q_text_clean = str(q_text).strip()
     q_hash = hashlib.sha256(q_text_clean.lower().encode()).hexdigest()
-    
     subject = str(item.get("subject", "General Knowledge")).strip()
     language = "Hindi" if "hindi" in subject.lower() else "English"
 
@@ -220,6 +239,7 @@ def insert_question_into_cluster(item):
         "option_d": str(item.get("option_d", "N/A")),
         "correct_option": str(item.get("correct_option", "A")).upper()[:1],
         "explanation": str(item.get("explanation", "NCERT Verified Standard Fact.")),
+        "difficulty": str(item.get("difficulty", "Medium")),
         "exam_name": str(item.get("exam", "Competitive Exams")),
         "subject_name": subject,
         "chapter_name": str(item.get("chapter", "General")),
@@ -227,6 +247,7 @@ def insert_question_into_cluster(item):
         "content_hash": q_hash
     }
 
+    # 2. SAVE IF NOT DUPLICATE
     for client in db_clients:
         try:
             client.table("questions").insert(data_payload).execute()
@@ -237,10 +258,9 @@ def insert_question_into_cluster(item):
     return False, "duplicate_or_failed"
 
 
-# Multi-Source Unlimited Fast Open-Source Scraper
 def fetch_open_source_questions_ncert_verified(target_count=500):
     saved = 0
-    batch_size = 20  # AI NCERT Verification ke liye 20 ka batch
+    batch_size = 20
     loops = target_count // batch_size
     
     for loop_idx in range(loops):
@@ -259,16 +279,10 @@ def fetch_open_source_questions_ncert_verified(target_count=500):
                         "category": html.unescape(item.get("category", ""))
                     })
                 
-                # PEHLE AI SE NCERT VERIFY KARWAYEIN
                 prompt = f"""
                 You are an NCERT Curriculum Verifier.
                 Verify these internet questions against NCERT/Academic facts.
-                
-                RULES:
-                1. Correct any wrong answers according to NCERT facts.
-                2. Ensure wrong options are contextually relevant to question topic.
-                3. Set correct_option="A" with NCERT answer in option_a.
-                4. Keep language English (unless subject is Hindi).
+                Tag difficulty as 'Easy', 'Medium', or 'Hard'.
 
                 OUTPUT FORMAT (Strict Raw JSON Array ONLY):
                 [
@@ -280,6 +294,7 @@ def fetch_open_source_questions_ncert_verified(target_count=500):
                     "option_d": "Wrong 3",
                     "correct_option": "A",
                     "explanation": "NCERT Verification Note",
+                    "difficulty": "Easy / Medium / Hard",
                     "exam": "General Exams",
                     "subject": "General Knowledge",
                     "chapter": "Misc"
@@ -289,7 +304,6 @@ def fetch_open_source_questions_ncert_verified(target_count=500):
                 Raw Data to verify: {json.dumps(raw_questions)}
                 """
                 
-                # VERIFIED DATA KO HI LEIN
                 verified_mcqs = call_ai_fast(prompt)
                 
                 for item in verified_mcqs:
@@ -303,84 +317,6 @@ def fetch_open_source_questions_ncert_verified(target_count=500):
             
     return saved
 
-    saved = 0
-    
-    # Source 1: OpenTDB Multi-Category Fetch Loop
-    categories = [9, 17, 18, 19, 21, 22, 23, 27]  # GK, Science, Computers, Math, History, Geography, Politics, Animals
-    for cat in categories:
-        if saved >= target_count:
-            break
-        try:
-            url = f"https://opentdb.com/api.php?amount=50&category={cat}&type=multiple"
-            resp = requests.get(url, timeout=5).json()
-            if resp.get("response_code") == 0:
-                for item in resp.get("results", []):
-                    q_raw = html.unescape(item.get("question", ""))
-                    corr = html.unescape(item.get("correct_answer", ""))
-                    inc = [html.unescape(x) for x in item.get("incorrect_answers", [])]
-                    
-                    if len(inc) < 3:
-                        continue
-                    
-                    q_item = {
-                        "question": q_raw,
-                        "option_a": corr,
-                        "option_b": inc[0],
-                        "option_c": inc[1],
-                        "option_d": inc[2],
-                        "correct_option": "A",
-                        "explanation": f"NCERT Verified Standard Academic Fact for Subject: {item.get('category')}",
-                        "exam": "Competitive Exams",
-                        "subject": html.unescape(item.get("category", "General Knowledge")),
-                        "chapter": "Misc"
-                    }
-                    
-                    status, _ = insert_question_into_cluster(q_item)
-                    if status:
-                        saved += 1
-                        if saved >= target_count:
-                            break
-        except Exception:
-            pass
-
-    # Source 2: The Trivia API (Unlimited Backup)
-    if saved < target_count:
-        for _ in range(10):
-            if saved >= target_count:
-                break
-            try:
-                url = "https://the-trivia-api.com/v2/questions?limit=50"
-                resp = requests.get(url, timeout=5).json()
-                for item in resp:
-                    q_raw = item.get("question", {}).get("text", "")
-                    corr = item.get("correctAnswer", "")
-                    inc = item.get("incorrectAnswers", [])
-                    
-                    if not q_raw or len(inc) < 3:
-                        continue
-                        
-                    q_item = {
-                        "question": q_raw,
-                        "option_a": corr,
-                        "option_b": inc[0],
-                        "option_c": inc[1],
-                        "option_d": inc[2],
-                        "correct_option": "A",
-                        "explanation": f"NCERT Verified Fact. Category: {item.get('category')}",
-                        "exam": "General Exams",
-                        "subject": item.get("category", "General Knowledge"),
-                        "chapter": "Misc"
-                    }
-                    status, _ = insert_question_into_cluster(q_item)
-                    if status:
-                        saved += 1
-                        if saved >= target_count:
-                            break
-            except Exception:
-                pass
-
-    return saved
-
 
 async def file_queue_worker():
     while True:
@@ -391,39 +327,53 @@ async def file_queue_worker():
             file_path = f"/tmp/{file_name}"
             await file.download_to_drive(file_path)
             
-            status_msg = await update.message.reply_text(f"⚙️ **Processing PDF:** `{file_name}`...")
+            status_msg = await update.message.reply_text(f"⚙️ **Processing File:** `{file_name}`...")
             
-            try:
-                chunks, total_pages = extract_text_chunks_large_pdf(file_path, pages_per_chunk=8)
-            except Exception as e:
-                await status_msg.edit_text(f"❌ Extraction error: {str(e)}")
-                if os.path.exists(file_path): 
-                    os.remove(file_path)
-                file_queue.task_done()
-                continue
-
+            # Check if file is an Image or PDF
+            is_image = file_name.lower().endswith(('.jpg', '.jpeg', '.png'))
+            
             saved_count = 0
             duplicate_count = 0
-            total_splits = len(chunks)
-
-            for idx, (chunk_text, page_num) in enumerate(chunks):
-                try:
-                    await status_msg.edit_text(
-                        f"⚙️ **Processing `{file_name}`**\n"
-                        f"Batch {idx+1}/{total_splits} (Page {page_num}/{total_pages})\n"
-                        f"📥 **Saved:** `{saved_count}` | ⚠️ **Duplicates Skipped:** `{duplicate_count}`"
-                    )
-                except Exception:
-                    pass
-
-                mcqs = call_ai_fast(chunk_text)
-                
+            
+            if is_image:
+                await status_msg.edit_text(f"🖼️ **Running Vision AI OCR on Image:** `{file_name}`...")
+                mcqs = process_vision_ai(file_path)
                 for item in mcqs:
                     status, flag = insert_question_into_cluster(item)
                     if status:
                         saved_count += 1
                     elif flag in ["duplicate", "duplicate_or_failed"]:
                         duplicate_count += 1
+            else:
+                try:
+                    chunks, total_pages = extract_text_chunks_large_pdf(file_path, pages_per_chunk=8)
+                except Exception as e:
+                    await status_msg.edit_text(f"❌ Extraction error: {str(e)}")
+                    if os.path.exists(file_path): 
+                        os.remove(file_path)
+                    file_queue.task_done()
+                    continue
+
+                total_splits = len(chunks)
+
+                for idx, (chunk_text, page_num) in enumerate(chunks):
+                    try:
+                        await status_msg.edit_text(
+                            f"⚙️ **Processing `{file_name}`**\n"
+                            f"Batch {idx+1}/{total_splits} (Page {page_num}/{total_pages})\n"
+                            f"📥 **Saved:** `{saved_count}` | ⚠️ **Duplicates Skipped:** `{duplicate_count}`"
+                        )
+                    except Exception:
+                        pass
+
+                    mcqs = call_ai_fast(chunk_text)
+                    
+                    for item in mcqs:
+                        status, flag = insert_question_into_cluster(item)
+                        if status:
+                            saved_count += 1
+                        elif flag in ["duplicate", "duplicate_or_failed"]:
+                            duplicate_count += 1
 
             if os.path.exists(file_path): 
                 os.remove(file_path)
@@ -432,7 +382,7 @@ async def file_queue_worker():
             queue_remaining = file_queue.qsize()
             await status_msg.edit_text(
                 f"✅ **Finished Process:** `{file_name}`\n\n"
-                f"📥 **NCERT Verified Questions Saved:** `{saved_count}`\n"
+                f"📥 **NCERT Verified Saved:** `{saved_count}`\n"
                 f"⚠️ **Duplicates Skipped:** `{duplicate_count}`\n"
                 f"⏱️ **Total Time Taken:** `{format_time(total_time)}`\n"
                 f"🔄 **Remaining Queue:** `{queue_remaining}` files"
@@ -446,9 +396,9 @@ async def file_queue_worker():
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 **Fast Multi-Source MCQ Bot Active!**\n\n"
-        "📁 Upload multiple PDFs (up to 100MB each).\n"
-        "📊 Type `/stats` to see live storage.\n"
+        "👋 **Smart Vision & OCR MCQ Bot Active!**\n\n"
+        "📁 Upload PDFs or Images/Photos (.jpg, .png).\n"
+        "📊 Type `/stats` for database analytics.\n"
         "🌐 Type `/scrape` to auto-fetch 500+ NCERT-verified questions."
     )
 
@@ -476,30 +426,34 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🌐 Starting High-Speed Scraper (Fetching 500 Questions)...")
+    msg = await update.message.reply_text("🌐 Starting Verified NCERT Scraper (Target: 500 Questions)...")
     start_time = time.time()
     saved = fetch_open_source_questions_ncert_verified(target_count=500)
     total_time = time.time() - start_time
     await msg.edit_text(
         f"✅ **Auto-Run Scraper Complete!**\n\n"
-        f"📥 **NCERT Verified Questions Saved:** `{saved}`\n"
+        f"📥 **NCERT Verified Saved:** `{saved}`\n"
         f"⏱️ **Total Time Taken:** `{format_time(total_time)}`"
     )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if doc.file_size > 100 * 1024 * 1024:
-        await update.message.reply_text(f"❌ File `{doc.file_name}` exceeds 100MB limit.")
+    doc = update.message.document or update.message.photo[-1]
+    file_id = doc.file_id
+    file_name = getattr(doc, 'file_name', f"photo_{int(time.time())}.jpg")
+    file_size = getattr(doc, 'file_size', 0)
+
+    if file_size > 100 * 1024 * 1024:
+        await update.message.reply_text(f"❌ File `{file_name}` exceeds 100MB limit.")
         return
 
-    await file_queue.put((update, context, doc.file_id, doc.file_name, doc.file_size))
+    await file_queue.put((update, context, file_id, file_name, file_size))
     
     q_size = file_queue.qsize()
     if q_size == 1:
-        await update.message.reply_text(f"📥 Received `{doc.file_name}`. Processing started...")
+        await update.message.reply_text(f"📥 Received `{file_name}`. Processing started...")
     else:
-        await update.message.reply_text(f"📥 Received `{doc.file_name}`. Added to Queue (Position #{q_size}).")
+        await update.message.reply_text(f"📥 Received `{file_name}`. Added to Queue (Position #{q_size}).")
 
 
 def main():
@@ -508,7 +462,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("scrape", scrape_command))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_document))
     
     loop = asyncio.get_event_loop()
     loop.create_task(file_queue_worker())
