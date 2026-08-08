@@ -16,7 +16,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from supabase import create_client, Client
 from groq import Groq
 from google import genai
-from thefuzz import fuzz
 
 # Environment Variables Setup
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -68,7 +67,12 @@ deepseek_client = OpenAI(base_url="https://api.deepseek.com", api_key=DEEPSEEK_A
 file_queue = asyncio.Queue()
 
 
-def extract_text_chunks_large_pdf(file_path, pages_per_chunk=3):
+def format_time(seconds):
+    mins, secs = divmod(int(seconds), 60)
+    return f"{mins}m {secs}s"
+
+
+def extract_text_chunks_large_pdf(file_path, pages_per_chunk=8):
     reader = pypdf.PdfReader(file_path)
     total_pages = len(reader.pages)
     chunks = []
@@ -86,7 +90,7 @@ def extract_text_chunks_large_pdf(file_path, pages_per_chunk=3):
 def build_ai_prompt(text_chunk):
     return f"""
     You are an AI Educational Data Parser & NCERT Syllabus Verifier.
-    Extract all MCQs, One-Liners, Notes, or Q&A tables from the text below.
+    Extract MCQs, One-Liners, Notes from text below.
 
     RULES FOR CATEGORIZATION & TRANSLATION:
     1. Identify 'exam_name', 'subject_name', and 'chapter_name' automatically from context.
@@ -99,7 +103,7 @@ def build_ai_prompt(text_chunk):
     4. NCERT VERIFICATION:
        - Cross-check answers with NCERT Syllabus (Class 6th-12th). Correct any mistakes and state reason in 'explanation'.
 
-    OUTPUT FORMAT (Raw JSON Array ONLY):
+    OUTPUT FORMAT (Raw JSON Array Only):
     [
       {{
         "question": "Question text",
@@ -116,20 +120,16 @@ def build_ai_prompt(text_chunk):
       }}
     ]
 
-    Do NOT include markdown formatting like ```json. Output raw JSON array only.
-
     Text Chunk:
-    {text_chunk[:10000]}
+    {text_chunk[:12000]}
     """
 
 
 def parse_json_response(raw_text):
-    if raw_text.startswith("```json"):
-        raw_text = raw_text[7:]
-    if raw_text.startswith("```"):
-        raw_text = raw_text[3:]
-    if raw_text.endswith("```"):
-        raw_text = raw_text[:-3]
+    if "```" in raw_text:
+        raw_text = raw_text.split("```")[1]
+    if raw_text.startswith("json"):
+        raw_text = raw_text[4:]
     try:
         data = json.loads(raw_text.strip())
         return data if isinstance(data, list) else []
@@ -137,51 +137,38 @@ def parse_json_response(raw_text):
         return []
 
 
-def call_ai_with_super_cluster_fallback(prompt_text):
+def call_ai_fast(prompt_text):
     prompt = prompt_text if "OUTPUT FORMAT" in prompt_text else build_ai_prompt(prompt_text)
     
-    # Provider List Strategy
+    # Priority Fast Rotation Cluster
     providers = [
-        ("Groq", lambda: groq_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama-3.1-8b-instant").choices[0].message.content),
-        ("SambaNova", lambda: sambanova_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="Meta-Llama-3.1-8B-Instruct").choices[0].message.content),
-        ("Cerebras", lambda: cerebras_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama3.1-8b").choices[0].message.content),
-        ("Gemini", lambda: gemini_client.models.generate_content(model='gemini-1.5-flash', contents=prompt).text),
-        ("Cohere", lambda: cohere_client.chat(message=prompt, model="command-r-plus").text),
-        ("DeepSeek", lambda: deepseek_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="deepseek-chat").choices[0].message.content),
-        ("Claude", lambda: anthropic_client.messages.create(model="claude-3-haiku-20240307", max_tokens=2000, messages=[{"role": "user", "content": prompt}]).content[0].text)
-
-        ("Together", lambda: together_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo").choices[0].message.content),
-        ("OpenRouter", lambda: openrouter_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/llama-3.3-70b-instruct:free").choices[0].message.content),
-        ("DeepInfra", lambda: deepinfra_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/Meta-Llama-3.1-8B-Instruct").choices[0].message.content),
-        ("Fireworks", lambda: fireworks_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="accounts/fireworks/models/llama-v3p1-8b-instruct").choices[0].message.content),
-        ("Mistral", lambda: mistral_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="open-mistral-7b").choices[0].message.content),
-        ("HuggingFace", lambda: hf_client.text_generation(prompt, model="meta-llama/Llama-3.2-3B-Instruct"))
+        ("Groq", lambda: groq_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama-3.1-8b-instant").choices[0].message.content if groq_client else None),
+        ("SambaNova", lambda: sambanova_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="Meta-Llama-3.1-8B-Instruct").choices[0].message.content if sambanova_client else None),
+        ("Gemini", lambda: gemini_client.models.generate_content(model='gemini-1.5-flash', contents=prompt).text if gemini_client else None),
+        ("Cerebras", lambda: cerebras_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama3.1-8b").choices[0].message.content if cerebras_client else None),
+        ("DeepSeek", lambda: deepseek_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="deepseek-chat").choices[0].message.content if deepseek_client else None),
+        ("Cohere", lambda: cohere_client.chat(message=prompt, model="command-r-plus").text if cohere_client else None),
+        ("Claude", lambda: anthropic_client.messages.create(model="claude-3-haiku-20240307", max_tokens=2000, messages=[{"role": "user", "content": prompt}]).content[0].text if anthropic_client else None),
+        ("Together", lambda: together_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo").choices[0].message.content if together_client else None),
+        ("OpenRouter", lambda: openrouter_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/llama-3.3-70b-instruct:free").choices[0].message.content if openrouter_client else None),
+        ("DeepInfra", lambda: deepinfra_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="meta-llama/Meta-Llama-3.1-8B-Instruct").choices[0].message.content if deepinfra_client else None),
+        ("Fireworks", lambda: fireworks_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="accounts/fireworks/models/llama-v3p1-8b-instruct").choices[0].message.content if fireworks_client else None),
+        ("Mistral", lambda: mistral_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="open-mistral-7b").choices[0].message.content if mistral_client else None),
+        ("HuggingFace", lambda: hf_client.text_generation(prompt, model="meta-llama/Llama-3.2-3B-Instruct") if hf_client else None)
     ]
 
-    for name, client_func in providers:
+    for name, func in providers:
         try:
-            raw_res = client_func()
-            parsed = parse_json_response(raw_res.strip())
-            if parsed:
-                return parsed
+            res = func()
+            if res:
+                parsed = parse_json_response(res.strip())
+                if parsed:
+                    return parsed
         except Exception:
             continue
 
     time.sleep(2)
     return []
-
-
-def is_semantic_duplicate(client: Client, question_text: str) -> bool:
-    try:
-        res = client.table("questions").select("question_text").order("id", desc=True).limit(30).execute()
-        for row in res.data:
-            existing_q = row.get("question_text", "")
-            ratio = fuzz.ratio(question_text.lower(), existing_q.lower())
-            if ratio > 85:
-                return True
-    except Exception:
-        pass
-    return False
 
 
 def insert_question_into_cluster(item):
@@ -193,8 +180,7 @@ def insert_question_into_cluster(item):
     q_hash = hashlib.sha256(q_text_clean.lower().encode()).hexdigest()
     
     subject = str(item.get("subject", "General Knowledge")).strip()
-    is_hindi_subject = "hindi" in subject.lower()
-    language = "Hindi" if is_hindi_subject else "English"
+    language = "Hindi" if "hindi" in subject.lower() else "English"
 
     data_payload = {
         "question_text": q_text_clean,
@@ -212,9 +198,6 @@ def insert_question_into_cluster(item):
     }
 
     for client in db_clients:
-        if is_semantic_duplicate(client, q_text_clean):
-            return False, "duplicate"
-            
         try:
             client.table("questions").insert(data_payload).execute()
             return True, "saved"
@@ -224,10 +207,9 @@ def insert_question_into_cluster(item):
     return False, "duplicate_or_failed"
 
 
-# NCERT Verified Bulk Open-Source Scraper
 def fetch_open_source_questions_ncert_verified(target_count=500):
     saved = 0
-    batch_size = 20
+    batch_size = 50
     loops = target_count // batch_size
     
     for loop_idx in range(loops):
@@ -246,46 +228,37 @@ def fetch_open_source_questions_ncert_verified(target_count=500):
                     })
                 
                 prompt = f"""
-                You are an NCERT Curriculum Verifier.
-                Verify these internet questions against NCERT/Academic facts.
+                NCERT Verifier: Verify internet MCQs against NCERT facts.
                 
-                RULES:
-                1. Correct any wrong answers according to NCERT facts.
-                2. Ensure wrong options are contextually relevant to question topic.
-                3. Set correct_option="A" with NCERT answer in option_a.
-                4. Keep language English (unless subject is Hindi).
-
-                OUTPUT FORMAT (Strict Raw JSON Array ONLY):
+                OUTPUT FORMAT (Raw JSON Array):
                 [
                   {{
                     "question": "Question text",
                     "option_a": "NCERT Verified Correct Answer",
-                    "option_b": "Contextual wrong option 1",
-                    "option_c": "Contextual wrong option 2",
-                    "option_d": "Contextual wrong option 3",
+                    "option_b": "Wrong 1",
+                    "option_c": "Wrong 2",
+                    "option_d": "Wrong 3",
                     "correct_option": "A",
-                    "explanation": "NCERT Verification: Brief concept note",
+                    "explanation": "NCERT Note",
                     "exam": "General Exams",
                     "subject": "General Knowledge",
                     "chapter": "Misc"
                   }}
                 ]
-
-                Raw Data:
-                {json.dumps(raw_questions)}
+                
+                Data to verify: {json.dumps(raw_questions)}
                 """
                 
-                verified_mcqs = call_ai_with_super_cluster_fallback(prompt)
+                verified_mcqs = call_ai_fast(prompt)
                 for item in verified_mcqs:
                     status, _ = insert_question_into_cluster(item)
                     if status:
                         saved += 1
                         
-            time.sleep(2)
+            time.sleep(1)
             
         except Exception as e:
-            print(f"Verified Scraper Batch {loop_idx+1} Error: {e}")
-            time.sleep(3)
+            print(f"Scraper Batch {loop_idx+1} Error: {e}")
             
     return saved
 
@@ -293,17 +266,18 @@ def fetch_open_source_questions_ncert_verified(target_count=500):
 async def file_queue_worker():
     while True:
         update, context, file_id, file_name, file_size = await file_queue.get()
+        start_time = time.time()
         try:
             file = await context.bot.get_file(file_id)
             file_path = f"/tmp/{file_name}"
             await file.download_to_drive(file_path)
             
-            status_msg = await update.message.reply_text(f"⚙️ **Processing File from Queue:** `{file_name}`...")
+            status_msg = await update.message.reply_text(f"⚙️ **Processing PDF:** `{file_name}`...")
             
             try:
-                chunks, total_pages = extract_text_chunks_large_pdf(file_path, pages_per_chunk=3)
+                chunks, total_pages = extract_text_chunks_large_pdf(file_path, pages_per_chunk=8)
             except Exception as e:
-                await status_msg.edit_text(f"❌ Failed to extract PDF `{file_name}`: {str(e)}")
+                await status_msg.edit_text(f"❌ Extraction error: {str(e)}")
                 if os.path.exists(file_path): 
                     os.remove(file_path)
                 file_queue.task_done()
@@ -323,7 +297,7 @@ async def file_queue_worker():
                 except Exception:
                     pass
 
-                mcqs = call_ai_with_super_cluster_fallback(chunk_text)
+                mcqs = call_ai_fast(chunk_text)
                 
                 for item in mcqs:
                     status, flag = insert_question_into_cluster(item)
@@ -332,28 +306,28 @@ async def file_queue_worker():
                     elif flag in ["duplicate", "duplicate_or_failed"]:
                         duplicate_count += 1
 
-                time.sleep(1.5)
-
-            if os.path.exists(file_path):
+            if os.path.exists(file_path): 
                 os.remove(file_path)
 
+            total_time = time.time() - start_time
             queue_remaining = file_queue.qsize()
             await status_msg.edit_text(
-                f"✅ **Finished `{file_name}`!**\n\n"
-                f"📥 **NCERT Verified Saved:** `{saved_count}`\n"
+                f"✅ **Finished Process:** `{file_name}`\n\n"
+                f"📥 **NCERT Verified Questions Saved:** `{saved_count}`\n"
                 f"⚠️ **Duplicates Skipped:** `{duplicate_count}`\n"
+                f"⏱️ **Total Time Taken:** `{format_time(total_time)}`\n"
                 f"🔄 **Remaining Queue:** `{queue_remaining}` files"
             )
 
         except Exception as err:
-            print(f"Error processing file {file_name}: {err}")
+            print(f"Queue Worker Error: {err}")
         finally:
             file_queue.task_done()
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 **Super Multi-AI Cluster Powered MCQ Bot Active!**\n\n"
+        "👋 **Fast 13-AI Cluster MCQ Bot Active!**\n\n"
         "📁 Upload multiple PDFs (up to 100MB each) - Queue will process sequentially.\n"
         "📊 Type `/stats` to see detailed category & DB analytics.\n"
         "🌐 Type `/scrape` to auto-fetch 500+ NCERT-verified open-source questions."
@@ -383,9 +357,15 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🌐 Starting NCERT-Verified Open-Source Scraper (Target: 500+ Questions)...")
+    msg = await update.message.reply_text("🌐 Starting Fast NCERT Scraper (Target: 500+ Questions)...")
+    start_time = time.time()
     saved = fetch_open_source_questions_ncert_verified(target_count=500)
-    await msg.edit_text(f"✅ Auto-Run Scraper Complete!\n\n📥 **NCERT Verified Questions Saved:** `{saved}`")
+    total_time = time.time() - start_time
+    await msg.edit_text(
+        f"✅ **Auto-Run Scraper Complete!**\n\n"
+        f"📥 **NCERT Verified Questions Saved:** `{saved}`\n"
+        f"⏱️ **Total Time Taken:** `{format_time(total_time)}`"
+    )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -414,7 +394,7 @@ def main():
     loop = asyncio.get_event_loop()
     loop.create_task(file_queue_worker())
     
-    print("Super Multi-AI Cluster Powered Bot Running...")
+    print("Fast Bot Engine Running...")
     app.run_polling()
 
 if __name__ == "__main__":
