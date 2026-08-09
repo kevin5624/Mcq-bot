@@ -1,36 +1,38 @@
-name: MCQ Queue Worker
+name: V5 MCQ Queue Worker
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/5 * * * *'
-    - cron: '0 0 * * *'
+    - cron: "*/5 * * * *"
 
 concurrency:
-  group: mcq-queue-worker
+  group: v5-mcq-queue-worker
   cancel-in-progress: false
 
 jobs:
-  process-one-job:
+  process-queue:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Process one queue job
+      - name: Run V5 Worker
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
@@ -42,10 +44,12 @@ jobs:
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+
           SUPABASE_URL_1: ${{ secrets.SUPABASE_URL_1 }}
           SUPABASE_KEY_1: ${{ secrets.SUPABASE_KEY_1 }}
+
           GROQ_MODEL: ${{ secrets.GROQ_MODEL }}
           OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
           DEEPSEEK_MODEL: ${{ secrets.DEEPSEEK_MODEL }}
@@ -55,4 +59,5 @@ jobs:
           FIREWORKS_MODEL: ${{ secrets.FIREWORKS_MODEL }}
           DEEPINFRA_MODEL: ${{ secrets.DEEPINFRA_MODEL }}
           TOGETHER_MODEL: ${{ secrets.TOGETHER_MODEL }}
+
         run: python worker.py
